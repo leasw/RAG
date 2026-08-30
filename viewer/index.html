@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>메모리 뷰어</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #1a1d24; --border: #2a2e37;
+    --text: #e6e8eb; --muted: #8b93a1;
+    --stm: #3b82f6; --mtm: #22c55e;
+    --accent: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+    font-size: 13px;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .stat { font-size: 12px; color: var(--muted); }
+  .stat b { color: var(--text); }
+  .tabs { display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 8px 16px; cursor: pointer; color: var(--muted);
+    border-bottom: 2px solid transparent; font-size: 13px;
+  }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .toolbar {
+    display: flex; gap: 10px; padding: 12px 20px; align-items: center; flex-wrap: wrap;
+  }
+  input[type=text] {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 10px; border-radius: 6px; font-size: 13px; width: 260px;
+  }
+  select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 8px; border-radius: 6px; font-size: 13px;
+  }
+  .count { color: var(--muted); font-size: 12px; }
+  main { padding: 0 20px 30px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase;
+    position: sticky; top: 0; background: var(--bg); cursor: pointer; user-select: none;
+  }
+  th:hover { color: var(--text); }
+  tr:hover td { background: #ffffff06; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+    font-weight: 600;
+  }
+  .badge.stm { background: #3b82f633; color: #7ab3ff; }
+  .badge.mtm { background: #22c55e33; color: #6ee7a0; }
+  .badge.created { background: #64748b33; color: #a3aebd; }
+  .badge.promoted { background: #22c55e33; color: #6ee7a0; }
+  .badge.dropped { background: #ef444433; color: #fca5a5; }
+  .badge.updated { background: #f59e0b33; color: #fbbf7f; }
+  .badge.absorbed_duplicate { background: #a855f733; color: #d8b4fe; }
+  .badge.backfill_existing { background: #64748b33; color: #a3aebd; }
+  .views { font-variant-numeric: tabular-nums; color: var(--accent); }
+  .text-cell { max-width: 640px; line-height: 1.5; }
+  .meta-cell { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .empty { text-align: center; color: var(--muted); padding: 40px; }
+  .bar-wrap { width: 60px; height: 6px; background: #ffffff11; border-radius: 3px; overflow: hidden; display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .bar { height: 100%; background: var(--accent); }
+  tr.clickable { cursor: pointer; }
+
+  /* 채팅방 탭: 좌측 목록 + 우측 스레드 */
+  .rooms-layout { display: flex; gap: 0; height: calc(100vh - 210px); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .rooms-list { width: 300px; overflow-y: auto; border-right: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .room-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .room-item:hover { background: #ffffff08; }
+  .room-item.active { background: #f59e0b1a; border-left: 3px solid var(--accent); }
+  .room-item .name { font-weight: 600; font-size: 12.5px; }
+  .room-item .sub { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .room-group-label { padding: 8px 14px 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .thread-pane { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .thread-empty { color: var(--muted); text-align: center; padding: 60px 0; }
+  .bubble-row { margin-bottom: 12px; display: flex; }
+  .bubble-row.mine { justify-content: flex-end; }
+  .bubble {
+    max-width: 72%; padding: 8px 12px; border-radius: 10px; background: var(--panel);
+    border: 1px solid var(--border); line-height: 1.5;
+  }
+  .bubble-row.mine .bubble { background: #f59e0b22; border-color: #f59e0b44; }
+  .bubble .who { font-size: 11px; color: var(--muted); margin-bottom: 3px; font-weight: 600; }
+  .bubble .ts { font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .bubble.highlight { outline: 2px solid var(--accent); }
+
+  /* 사실 -> 원문 팝업 */
+  .modal-backdrop {
+    display: none; position: fixed; inset: 0; background: #000000aa; z-index: 50;
+    align-items: center; justify-content: center;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    width: min(720px, 90vw); max-height: 80vh; display: flex; flex-direction: column;
+  }
+  .modal-head { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .modal-head .title { font-weight: 600; font-size: 13px; }
+  .modal-head .close { cursor: pointer; color: var(--muted); font-size: 18px; line-height: 1; }
+  .modal-head .close:hover { color: var(--text); }
+  .modal-fact { padding: 10px 18px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--accent); background: #f59e0b11; }
+  .modal-body { padding: 16px 18px; overflow-y: auto; }
+
+  /* 말풍선 안 마크다운 렌더링 */
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3, .md h4 { margin: 10px 0 6px; font-weight: 700; line-height: 1.3; }
+  .md h1 { font-size: 15px; } .md h2 { font-size: 14px; } .md h3 { font-size: 13.5px; } .md h4 { font-size: 13px; }
+  .md p { margin: 6px 0; }
+  .md ul, .md ol { margin: 6px 0; padding-left: 20px; }
+  .md li { margin: 2px 0; }
+  .md strong { font-weight: 700; color: #fff; }
+  .md code { background: #ffffff14; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .md table { width: auto; max-width: 100%; margin: 8px 0; font-size: 12px; }
+  .md th, .md td { padding: 5px 9px; border: 1px solid var(--border); }
+  .md th { background: #ffffff0a; }
+  .md table-wrap { display: block; overflow-x: auto; }
+  #live-dot.blip { animation: blip 0.6s ease-out; }
+  @keyframes blip { 0% { box-shadow: 0 0 0 0 #22c55e88; } 100% { box-shadow: 0 0 0 8px #22c55e00; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📦 메모리 뷰어</h1>
+  <span class="stat">STM <b id="stat-stm">-</b></span>
+  <span class="stat">MTM <b id="stat-mtm">-</b></span>
+  <span class="stat">아카이브 이벤트 <b id="stat-archive">-</b></span>
+  <span class="stat" style="margin-left:auto; display:flex; align-items:center; gap:6px">
+    <span id="live-dot" style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block"></span>
+    실시간
+  </span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="stm">STM</div>
+  <div class="tab" data-tab="mtm">MTM</div>
+  <div class="tab" data-tab="archive">아카이브 이력</div>
+  <div class="tab" data-tab="rooms">채팅방</div>
+</div>
+
+<div class="toolbar">
+  <input type="text" id="search" placeholder="사실 문장 검색...">
+  <select id="sort">
+    <option value="views_desc">조회수 높은 순</option>
+    <option value="views_asc">조회수 낮은 순</option>
+    <option value="date_desc">날짜 최신순</option>
+    <option value="date_asc">날짜 오래된순</option>
+  </select>
+  <select id="event-filter" style="display:none">
+    <option value="">모든 이벤트</option>
+    <option value="created">created</option>
+    <option value="promoted">promoted</option>
+    <option value="updated">updated</option>
+    <option value="absorbed_duplicate">absorbed_duplicate</option>
+    <option value="dropped">dropped</option>
+    <option value="backfill_existing">backfill_existing</option>
+  </select>
+  <span class="count" id="count"></span>
+</div>
+
+<main>
+  <table id="table"><thead></thead><tbody></tbody></table>
+  <div id="rooms-view" class="rooms-layout" style="display:none">
+    <div class="rooms-list" id="rooms-list"></div>
+    <div class="thread-pane" id="thread-pane"><div class="thread-empty">왼쪽에서 채팅방 또는 세션을 선택하세요</div></div>
+  </div>
+</main>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="title" id="modal-title">원본 대화</span>
+      <span class="close" id="modal-close">&times;</span>
+    </div>
+    <div class="modal-fact" id="modal-fact"></div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+let DATA = {facts: [], archive: [], stats: {}, rooms: {}, sessions: {}};
+let currentTab = "stm";
+let selectedRoom = null;   // {kind, id} — 채팅방 탭에서 지금 열어둔 스레드 (자동 갱신 시 유지)
+let lastDataStamp = "";    // 데이터가 실제로 바뀌었을 때만 다시 그리기 위한 지문
+
+async function load(isPoll) {
+  let res;
+  try {
+    res = await fetch("data.json", {cache: "no-store"});
+  } catch {
+    return; // 폴링 중 export_data.py가 파일을 쓰는 찰나와 겹쳐도 다음 틱에 다시 시도
+  }
+  if (!res.ok) return;
+  const text = await res.text();
+  if (isPoll && text === lastDataStamp) return; // 안 바뀌었으면 다시 안 그림 (스크롤 유지)
+  lastDataStamp = text;
+  DATA = JSON.parse(text);
+  DATA.rooms = DATA.rooms || {};
+  DATA.sessions = DATA.sessions || {};
+  document.getElementById("stat-stm").textContent =
+    `${DATA.stats.stm?.facts ?? 0}건 (조회수 합 ${(DATA.stats.stm?.views ?? 0).toFixed(1)})`;
+  document.getElementById("stat-mtm").textContent =
+    `${DATA.stats.mtm?.facts ?? 0}건 (조회수 합 ${(DATA.stats.mtm?.views ?? 0).toFixed(1)})`;
+  document.getElementById("stat-archive").textContent = `${DATA.archive.length}건`;
+  const dot = document.getElementById("live-dot");
+  if (dot) { dot.classList.remove("blip"); void dot.offsetWidth; dot.classList.add("blip"); }
+  render();
+}
+
+// 3초마다 data.json을 다시 읽는다. viewer/auto_export.py를 같이 띄워두면
+// (백그라운드에서 export_data.py를 반복 실행) 새로고침 없이 최신 상태가 반영된다.
+setInterval(() => load(true), 3000);
+
+function esc(s) {
+  return (s ?? "").toString().replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function maxViews(list) {
+  return Math.max(1, ...list.map(f => f.views || 0));
+}
+
+// source_type/source_id -> {kind, thread} 로 원문 채팅을 찾는다.
+function findThread(sourceType, sourceId) {
+  if (sourceType === "team_chat" && DATA.rooms[sourceId]) {
+    return {kind: "room", thread: DATA.rooms[sourceId]};
+  }
+  if (DATA.sessions[sourceId]) {
+    return {kind: "session", thread: DATA.sessions[sourceId]};
+  }
+  return null;
+}
+
+// 아주 가벼운 마크다운 -> HTML. CDN 없이 표/목록/굵게/헤더 정도만 지원한다.
+// LLM 답변에 나오는 정도의 마크다운(###, **, 1. 2., -, | | |)만 처리하면 충분하다.
+function renderMarkdown(raw) {
+  const lines = (raw || "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+
+  const inline = (s) => esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+?)`/g, "<code>$1</code>");
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // 표: | a | b | 다음 줄이 |---|---| 형태
+    if (/^\s*\|.*\|\s*$/.test(line) && lines[i + 1] && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
+      const rows = [];
+      rows.push(line);
+      i += 2; // 헤더 + 구분선
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { rows.push(lines[i]); i++; }
+      const cells = rows.map(r => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim()));
+      const [head, ...body] = cells;
+      out.push(`<div class="table-wrap"><table><thead><tr>${
+        head.map(c => `<th>${inline(c)}</th>`).join("")
+      }</tr></thead><tbody>${
+        body.map(r => `<tr>${r.map(c => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")
+      }</tbody></table></div>`);
+      continue;
+    }
+
+    // 헤더
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); i++; continue; }
+
+    // 번호 목록
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+[.)]\s+/, "")); i++;
+      }
+      out.push(`<ol>${items.map(it => `<li>${inline(it)}</li>`).join("")}</ol>`);
+      continue;
+    }
+
+    // 불릿 목록
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, "")); i++;
+      }
+      out.push(`<ul>${items.map(it => `<li>${inline(it)}</li>`).join("")}</ul>`);
+      continue;
+    }
+
+    // 빈 줄
+    if (!line.trim()) { i++; continue; }
+
+    // 일반 문단 (다음 특수 블록 전까지 한 줄씩 <br>로 합침)
+    const para = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() &&
+           !/^(#{1,4})\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) &&
+           !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\|.*\|\s*$/.test(lines[i])) {
+      para.push(lines[i]); i++;
+    }
+    out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+  }
+  return `<div class="md">${out.join("")}</div>`;
+}
+
+function bubbleHtml(kind, m) {
+  const mine = kind === "session" && m.role === "user";
+  return `
+    <div class="bubble-row ${mine ? "mine" : ""}">
+      <div class="bubble">
+        <div class="who">${esc(m.who || "")}</div>
+        ${renderMarkdown(m.text)}
+        <div class="ts">${esc((m.ts || "").replace("T", " "))}</div>
+      </div>
+    </div>`;
+}
+
+function openModal(factText, sourceType, sourceId) {
+  const found = findThread(sourceType, sourceId);
+  const backdrop = document.getElementById("modal-backdrop");
+  document.getElementById("modal-fact").textContent = factText ? `이 사실의 출처: ${factText}` : "";
+  if (!found) {
+    document.getElementById("modal-title").textContent = "원본을 찾을 수 없음";
+    document.getElementById("modal-body").innerHTML =
+      `<div class="thread-empty">source_id "${esc(sourceId)}" (${esc(sourceType)})에 해당하는 원본 로그가 없습니다.</div>`;
+  } else {
+    const t = found.thread;
+    document.getElementById("modal-title").textContent = t.name || t.id;
+    document.getElementById("modal-body").innerHTML =
+      t.messages.map(m => bubbleHtml(found.kind, m)).join("") ||
+      `<div class="thread-empty">메시지가 없습니다</div>`;
+  }
+  backdrop.classList.add("open");
+  document.getElementById("modal-body").scrollTop = document.getElementById("modal-body").scrollHeight;
+}
+
+document.getElementById("modal-close").addEventListener("click", () =>
+  document.getElementById("modal-backdrop").classList.remove("open"));
+document.getElementById("modal-backdrop").addEventListener("click", (e) => {
+  if (e.target.id === "modal-backdrop") e.target.classList.remove("open");
+});
+
+function renderFacts(tier) {
+  let rows = DATA.facts.filter(f => f.tier === tier);
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  if (q) rows = rows.filter(f => (f.text || "").toLowerCase().includes(q));
+
+  const sort = document.getElementById("sort").value;
+  rows.sort((a, b) => {
+    if (sort === "views_desc") return b.views - a.views;
+    if (sort === "views_asc") return a.views - b.views;
+    if (sort === "date_desc") return (b.date || "").localeCompare(a.date || "");
+    if (sort === "date_asc") return (a.date || "").localeCompare(b.date || "");
+  });
+
+  document.getElementById("count").textContent = `${rows.length}건`;
+  const mv = maxViews(rows);
+
+  document.querySelector("#table thead").innerHTML = `
+    <tr>
+      <th style="width:36px">#</th>
+      <th style="width:90px">날짜</th>
+      <th>사실 문장</th>
+      <th style="width:150px">조회수</th>
+      <th style="width:70px">returns</th>
+      <th style="width:140px">출처</th>
+    </tr>`;
+  document.querySelector("#table tbody").innerHTML = rows.map((f, i) => `
+    <tr class="clickable" data-text="${esc(f.text)}" data-source-type="${esc(f.source_type)}" data-source-id="${esc(f.source_id)}">
+      <td class="meta-cell">${i + 1}</td>
+      <td class="meta-cell">${esc(f.date)}</td>
+      <td class="text-cell">${esc(f.text)}</td>
+      <td class="views">
+        <span class="bar-wrap"><span class="bar" style="width:${(f.views / mv * 100).toFixed(0)}%"></span></span>
+        ${f.views.toFixed(3)}
+      </td>
+      <td class="meta-cell">${f.returns}</td>
+      <td class="meta-cell">${esc(f.source_type)}<br>${esc(f.source_id)}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="empty">데이터가 없습니다</td></tr>`;
+
+  document.querySelector("#table tbody").querySelectorAll("tr.clickable").forEach(tr => {
+    tr.addEventListener("click", () => openModal(
+      tr.dataset.text, tr.dataset.sourceType, tr.dataset.sourceId));
+  });
+}
+
+function renderArchive() {
+  let rows = DATA.archive.slice().reverse(); // 최신 이벤트 먼저
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  if (q) rows = rows.filter(r => (r.text || "").toLowerCase().includes(q));
+  const ev = document.getElementById("event-filter").value;
+  if (ev) rows = rows.filter(r => r.event === ev);
+
+  document.getElementById("count").textContent = `${rows.length}건`;
+
+  document.querySelector("#table thead").innerHTML = `
+    <tr>
+      <th style="width:150px">시각</th>
+      <th style="width:110px">이벤트</th>
+      <th style="width:70px">계층</th>
+      <th>사실 문장</th>
+      <th style="width:90px">조회수</th>
+      <th style="width:160px">비고</th>
+    </tr>`;
+  document.querySelector("#table tbody").innerHTML = rows.map(r => {
+    const extra = [];
+    if (r.to_tier) extra.push(`-> ${r.to_tier}`);
+    if (r.new_text) extra.push(`new: ${r.new_text.slice(0, 40)}`);
+    if (r.kept_id) extra.push(`kept_id: ${r.kept_id.slice(0, 8)}`);
+    return `
+    <tr class="clickable" data-text="${esc(r.text)}" data-source-type="${esc(r.source_type)}" data-source-id="${esc(r.source_id)}">
+      <td class="meta-cell">${esc(r.archived_at)}</td>
+      <td><span class="badge ${esc(r.event)}">${esc(r.event)}</span></td>
+      <td><span class="badge ${esc(r.tier)}">${esc(r.tier)}</span></td>
+      <td class="text-cell">${esc(r.text)}</td>
+      <td class="views">${(r.views ?? 0).toFixed(3)}</td>
+      <td class="meta-cell">${esc(extra.join(" · "))}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6" class="empty">데이터가 없습니다</td></tr>`;
+
+  document.querySelector("#table tbody").querySelectorAll("tr.clickable").forEach(tr => {
+    tr.addEventListener("click", () => openModal(
+      tr.dataset.text, tr.dataset.sourceType, tr.dataset.sourceId));
+  });
+}
+
+function renderRoomsList() {
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  const rooms = Object.values(DATA.rooms)
+    .filter(r => !q || r.name.toLowerCase().includes(q));
+  const sessions = Object.values(DATA.sessions)
+    .filter(s => !q || (s.name || "").toLowerCase().includes(q))
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  document.getElementById("count").textContent =
+    `채팅방 ${rooms.length}개 / AI 세션 ${sessions.length}개`;
+
+  let html = `<div class="room-group-label">팀 채팅방 (${rooms.length})</div>`;
+  html += rooms.map(r => `
+    <div class="room-item" data-kind="room" data-id="${esc(r.id)}">
+      <div class="name">${esc(r.name)}</div>
+      <div class="sub">${esc(r.period)} · ${r.message_count}건 · ${esc((r.members || []).join(", "))}</div>
+    </div>`).join("");
+  html += `<div class="room-group-label">AI 대화 세션 (${sessions.length})</div>`;
+  html += sessions.map(s => `
+    <div class="room-item" data-kind="session" data-id="${esc(s.id)}">
+      <div class="name">${esc(s.name)}</div>
+      <div class="sub">${esc(s.date)} · ${esc(s.user)} · ${s.message_count}턴${s.origin === "live" ? " · live" : ""}</div>
+    </div>`).join("");
+
+  const list = document.getElementById("rooms-list");
+  list.innerHTML = html;
+  list.querySelectorAll(".room-item").forEach(el => {
+    el.addEventListener("click", () => {
+      list.querySelectorAll(".room-item").forEach(x => x.classList.remove("active"));
+      el.classList.add("active");
+      selectedRoom = {kind: el.dataset.kind, id: el.dataset.id};
+      renderThread(el.dataset.kind, el.dataset.id);
+    });
+    if (selectedRoom && selectedRoom.kind === el.dataset.kind && selectedRoom.id === el.dataset.id) {
+      el.classList.add("active");
+    }
+  });
+  // 자동 갱신으로 다시 그려도 보고 있던 스레드는 유지한다 (예: 대화가 진행 중인 세션)
+  if (selectedRoom) renderThread(selectedRoom.kind, selectedRoom.id);
+}
+
+function renderThread(kind, id) {
+  const t = kind === "room" ? DATA.rooms[id] : DATA.sessions[id];
+  const pane = document.getElementById("thread-pane");
+  if (!t) { pane.innerHTML = `<div class="thread-empty">찾을 수 없습니다</div>`; return; }
+  pane.innerHTML = t.messages.map(m => bubbleHtml(kind === "room" ? "room" : "session", m)).join("") ||
+    `<div class="thread-empty">메시지가 없습니다</div>`;
+}
+
+function render() {
+  const isRooms = currentTab === "rooms";
+  document.getElementById("table").style.display = isRooms ? "none" : "";
+  document.getElementById("rooms-view").style.display = isRooms ? "flex" : "none";
+  document.getElementById("event-filter").style.display = currentTab === "archive" ? "" : "none";
+  document.getElementById("sort").style.display = (currentTab === "archive" || isRooms) ? "none" : "";
+  document.getElementById("search").placeholder = isRooms ? "채팅방/세션 이름 검색..." : "사실 문장 검색...";
+
+  if (currentTab === "stm") renderFacts("stm");
+  else if (currentTab === "mtm") renderFacts("mtm");
+  else if (currentTab === "archive") renderArchive();
+  else renderRoomsList();
+}
+
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+  t.classList.add("active");
+  currentTab = t.dataset.tab;
+  render();
+}));
+document.getElementById("search").addEventListener("input", render);
+document.getElementById("sort").addEventListener("change", render);
+document.getElementById("event-filter").addEventListener("change", render);
+
+load();
+</script>
+</body>
+</html>

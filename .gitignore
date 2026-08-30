@@ -6,3 +6,7 @@ docs/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# 재생성 가능한 대용량 생성물 (100MB 초과, doc_rag.build_index로 재생성)
+cache/
+index/doc_rag/embeddings.npy

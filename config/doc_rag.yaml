@@ -1,0 +1,78 @@
+# 문서 벡터 RAG 설정
+#
+# 파이프라인은 D:/RAG 벤치마크에서 nDCG@10 1위였던 조합을 그대로 가져옵니다.
+#   Dense(google/gemini-embedding-2) + BM25+ -> RRF -> local BAAI/bge-reranker-v2-m3
+# 벤치마크 결과: nDCG@10 avg 0.8581 (EN-1 0.7756 / KO-1 0.9615 / KO-2 0.8373)
+
+corpus:
+  # 인제스천 대상 루트. 상대 경로는 프로젝트 루트 기준.
+  #
+  # 이 RAG가 에이전트의 장기기억(LTM) 역할을 맡는다. 메모리 계층은 STM/MTM 2단계만
+  # 남고, "공식 계획서 / 조직 기준 / 확정된 산출물"은 전부 여기서 검색한다.
+  roots:
+    - "../20200504_지식서비스산업핵심기술개발사업"
+  # 인제스천에서 제외할 디렉터리 이름
+  exclude_dirs: [".git", "__pycache__", ".venv"]
+  # 개별 파일 최대 크기(MB). 넘으면 건너뜁니다.
+  max_file_mb: 120
+
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+  api_key_env: "OPENROUTER_API_KEY"
+  request_timeout_s: 120
+  max_retries: 5
+  batch_size: 32
+
+embedding:
+  # 500M급 로컬 임베딩 모델로 고정. D:/RAG 벤치마크의 로컬 모델 4종(모두 ~560-568M)
+  # 중 한국어 성적이 가장 좋았다 — nDCG@10 avg 0.8464 (KO-1 0.9615 / KO-2 0.8210).
+  #   arctic-ko 0.8464 > arctic-v2.0 0.8446 > mE5-large 0.8437 > KURE-v1 0.8421
+  # 로컬 GPU 추론이라 임베딩 API 비용/레이트리밋이 없고, 코퍼스 재빌드가 자유롭다.
+  backend: local            # local | openrouter
+  id: dragonkue/snowflake-arctic-embed-l-v2.0-ko
+  dimensions: 1024
+  device: cuda              # cuda 불가 시 cpu 자동 폴백
+  batch_size: 32
+  # arctic-embed 계열은 비대칭 인코딩: query에만 prefix, passage는 prefix 없음.
+  query_prefix: "query: "
+  passage_prefix: ""
+
+reranker:
+  backend: local            # local | openrouter
+  model_id: BAAI/bge-reranker-v2-m3
+  device: cuda              # cuda 불가 시 cpu 자동 폴백
+  batch_size: 16
+  max_length: 1024
+
+chunking:
+  # HybridChunker가 토큰 수를 세는 데 쓰는 토크나이저 (다국어/한국어)
+  tokenizer: BAAI/bge-m3
+  merge_peers: true
+  # 파일 형식별 청킹 파라미터. 기본값 위에 형식별로 덮어씁니다.
+  default:
+    max_tokens: 512
+    overlap_tokens: 64
+  by_format:
+    pdf:   { max_tokens: 512, overlap_tokens: 64 }
+    hwp:   { max_tokens: 640, overlap_tokens: 80 }   # 사업계획서/보고서 - 서술형 긴 문단
+    docx:  { max_tokens: 512, overlap_tokens: 64 }
+    pptx:  { max_tokens: 320, overlap_tokens: 32 }   # 슬라이드 - 짧고 조각난 텍스트
+    xlsx:  { max_tokens: 768, overlap_tokens: 0 }    # 표 - 행 경계에서만 자름
+    txt:   { max_tokens: 512, overlap_tokens: 64 }
+  # 이보다 짧은 청크는 버립니다(머리말/페이지번호 등 노이즈).
+  min_chars: 30
+
+retrieval:
+  dense_top_k: 30
+  sparse_top_k: 30
+  rrf_k: 60
+  final_top_k: 5          # STM/MTM(retrieve_memory)의 top_k와 맞춘 값
+  # 리랭커 점수가 이 값 미만인 결과는 버립니다(무근거 답변 방지).
+  min_rerank_score: -4.0
+
+ocr:
+  # 텍스트 레이어가 없는 스캔 PDF에만 적용되는 폴백 OCR (EasyOCR).
+  lang: [ko, en]
+  use_gpu: true
+  confidence_threshold: 0.4
+  scale: 2.0            # 렌더링 배율. 3.0은 느리기만 하고 이 코퍼스에선 이득이 없었다.

@@ -42,7 +42,7 @@ class AppConfig:
             memory_root=PROJECT_ROOT / "memory_seed",
             api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
             model=os.environ.get(
-                "OPENROUTER_MODEL", "google/gemma-4-31b-it:free"
+                "OPENROUTER_MODEL", "google/gemini-3.7-flash"
             ).strip(),
             base_url=os.environ.get(
                 "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"

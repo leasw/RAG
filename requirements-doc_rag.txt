@@ -1,0 +1,18 @@
+# 문서 벡터 RAG (doc_rag) 의존성.
+# torch는 이 머신에 이미 설치된 CUDA 빌드(2.11+cu128)를 그대로 사용하므로 포함하지 않는다.
+
+# 인제스천
+docling>=2.122          # PDF/DOCX/PPTX/XLSX 파싱 + HybridChunker
+pyhwp>=0.1b15           # HWP 5.0 바이너리 (Docling 미지원 형식)
+olefile>=0.47
+easyocr>=1.7            # 스캔 PDF용 한국어 OCR 폴백
+openpyxl>=3.1
+python-docx>=1.1
+
+# 검색
+requests>=2.31
+PyYAML>=6.0
+numpy>=1.26
+bm25s>=0.2.5            # BM25+ sparse
+transformers>=4.41      # cross-encoder 리랭커
+tqdm>=4.66

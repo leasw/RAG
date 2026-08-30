@@ -8,14 +8,38 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from .config import AppConfig
-from .memory_store import MemoryStore
+from .fact_memory import FactMemory
 from .prompts import SYSTEM_PROMPT
-from .schemas import RETRIEVE_MEMORY_TOOL
+from .attribution import attribute
+from .doc_rag_tool import DocSearchTool
+from .graph_tool import GraphSearchTool
+from .schemas import SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL
+from .session_recorder import SessionRecorder
+from . import memory_promote
 
 
 class ChatClient(Protocol):
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         ...
+
+
+def _for_replay(assistant_message: dict[str, Any]) -> dict[str, Any]:
+    """assistant 응답을 다음 요청에 다시 넣을 수 있는 형태로 줄인다.
+
+    Gemini 3.x는 응답에 `reasoning_details`(그 안에 reasoning.encrypted = thought
+    signature)를 실어 보내는데, 이걸 그대로 되돌려보내면 tool 결과가 사이에 끼는 순간
+    "Corrupted thought signature" 400이 난다. 서명이 그 시점의 대화 상태에 묶여 있어
+    재생이 안 되는 것으로 보인다.
+
+    추론 필드는 다음 턴에 필요한 정보가 아니므로 떼고 OpenAI 호환 최소 형태만 보낸다.
+    원본은 trace와 turn log에 그대로 남으므로 디버깅에는 지장이 없다.
+    """
+    kept = {"role": assistant_message.get("role", "assistant")}
+    if assistant_message.get("content") is not None:
+        kept["content"] = assistant_message["content"]
+    if assistant_message.get("tool_calls"):
+        kept["tool_calls"] = assistant_message["tool_calls"]
+    return kept
 
 
 @dataclass
@@ -24,6 +48,11 @@ class AgentTrace:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     final_sources: list[str] = field(default_factory=list)
     stopped_reason: str = ""
+    # 이번 턴에 도구가 돌려준 근거 카드 전부. 최종 답변이 나온 뒤 기여도 계산에 쓴다.
+    cards: list[dict[str, Any]] = field(default_factory=list)
+    attribution: list[dict[str, Any]] = field(default_factory=list)
+    attribution_method: str = ""
+    memory_prefetch: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,11 +99,76 @@ class TurnLogger:
 
 
 class AgentRuntime:
-    def __init__(self, config: AppConfig, client: ChatClient, memory_store: MemoryStore):
+    def __init__(
+        self,
+        config: AppConfig,
+        client: ChatClient,
+        memory: FactMemory,
+        doc_search: DocSearchTool | None = None,
+        graph_search: GraphSearchTool | None = None,
+        recorder: SessionRecorder | None = None,
+    ):
         self.config = config
         self.client = client
-        self.memory_store = memory_store
-        self.tools = [RETRIEVE_MEMORY_TOOL]
+        self.memory = memory
+        self.doc_search = doc_search if doc_search is not None else DocSearchTool()
+        self.graph_search = graph_search if graph_search is not None else GraphSearchTool()
+        # 이번 대화를 STM으로 남기는 기록기. None이면 기록하지 않는다(테스트/평가용).
+        self.recorder = recorder
+        # 도구는 검색 계층 둘뿐이다. 메모리(STM/MTM)는 도구가 아니라 매 턴 반드시
+        # 경유하는 전처리 파이프라인이라 여기 없다 — _prefetch_memory()가 담당한다.
+        self.tools = [SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL]
+        self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+            "search_documents": self.doc_search.run,
+            "search_graph": self.graph_search.run,
+        }
+        self._embed_fn: Callable[[Any], Any] | None = None
+        self._embed_tried = False
+
+    def _embedder(self):
+        """기여도 계산용 임베딩 함수. 없으면 None (텍스트 귀속도로만 계산).
+
+        search_documents가 이미 올려둔 임베더가 있으면 그걸 재사용한다. 같은 모델을
+        두 번 GPU에 올릴 이유가 없다.
+        """
+        if self._embed_tried:
+            return self._embed_fn
+        self._embed_tried = True
+
+        retriever = getattr(self.doc_search, "_retriever", None)
+        embedder = getattr(retriever, "embedder", None)
+        if embedder is None:
+            try:
+                from doc_rag.config import load_config
+                from doc_rag.embedding_factory import build_embedder
+
+                embedder = build_embedder(load_config())
+            except Exception:  # noqa: BLE001 - 임베딩이 없어도 계산은 되어야 한다
+                return None
+        self._embed_fn = lambda texts: embedder.embed(list(texts))
+        return self._embed_fn
+
+    def _prefetch_memory(self, user_query: str) -> list:
+        """STM/MTM 사실 조회. 도구가 아니라 매 턴 무조건 지나가는 파이프라인이다.
+
+        메모리는 "지금 굴러가는 맥락"이라 모델이 필요 여부를 판단할 대상이 아니다.
+        도구로 두면 실측상 절반의 턴에서 건너뛰어졌고, 그 결과 "아까 얘기한 그거"류
+        질문에서 맥락이 빠진 채 답이 나갔다. 그래서 판단을 없애고 항상 넣는다.
+
+        tier는 항상 all이다 — STM/MTM 중 어디를 볼지도 모델이 정할 일이 아니다.
+        """
+        return self.memory.search(user_query, tier="all", top_k=self.config.default_top_k)
+
+    @staticmethod
+    def _render_memory(facts: list) -> str:
+        if not facts:
+            return "[작업 메모리 STM/MTM] 이번 질문과 관련된 기억이 없습니다."
+        lines = ["[작업 메모리 STM/MTM — 자동 조회, 도구 호출 아님]",
+                 "아래는 이전 대화에서 뽑아 둔 사실 문장이다. 원문 대화가 아니다."]
+        for f in facts:
+            score = (f.meta or {}).get("score", "")
+            lines.append(f"- ({f.tier.upper()}, {f.date}, sim={score}) {f.text}")
+        return "\n".join(lines)
 
     def run(
         self,
@@ -82,15 +176,34 @@ class AgentRuntime:
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         log_dir: Path | None = None,
     ) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_query},
-        ]
         trace = AgentTrace()
         turn_logger = TurnLogger(log_dir) if log_dir else None
-        seen_tier_queries: set[tuple[str, str]] = set()
+        seen_tier_queries: set[tuple[str, str, str]] = set()
 
         self._emit(event_callback, turn_logger, "turn_start", {"query": user_query})
+
+        facts = self._prefetch_memory(user_query)
+        trace.memory_prefetch = {
+            "tier": "all",
+            "result_count": len(facts),
+            "facts": [{"id": f.id, "tier": f.tier, "text": f.text,
+                       "score": (f.meta or {}).get("score")} for f in facts],
+        }
+        for f in facts:
+            trace.cards.append({
+                "tool": "memory_pipeline",
+                "record_id": f.id,
+                "title": f.text[:60],
+                "content": f.text,
+                "source_ref": {"document_id": f.source_id, "path": f"{f.tier}/{f.id}"},
+            })
+        self._emit(event_callback, turn_logger, "memory_prefetch", trace.memory_prefetch)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": self._render_memory(facts)},
+            {"role": "user", "content": user_query},
+        ]
         for _ in range(self.config.max_tool_calls + 1):
             trace.llm_calls += 1
             message_roles = [message.get("role", "") for message in messages]
@@ -133,6 +246,7 @@ class AgentRuntime:
             if not tool_calls:
                 content = assistant_message.get("content") or ""
                 trace.stopped_reason = "final_answer"
+                self._score_attribution(content, trace)
                 self._emit(
                     event_callback,
                     turn_logger,
@@ -147,10 +261,12 @@ class AgentRuntime:
                     "trace": self._trace_dict(trace),
                     "messages": messages + [assistant_message],
                 }
+                self._record_to_stm(user_query, content, result)
+                self._check_promotion(trace, result)
                 self._write_turn_log(turn_logger, user_query, result)
                 return result
 
-            messages.append(assistant_message)
+            messages.append(_for_replay(assistant_message))
             for tool_call in tool_calls:
                 result_message = self._execute_tool_call(
                     tool_call, seen_tier_queries, trace, event_callback, turn_logger
@@ -188,7 +304,7 @@ class AgentRuntime:
     def _execute_tool_call(
         self,
         tool_call: dict[str, Any],
-        seen_tier_queries: set[tuple[str, str]],
+        seen_tier_queries: set[tuple[str, str, str]],
         trace: AgentTrace,
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         turn_logger: TurnLogger | None = None,
@@ -196,7 +312,7 @@ class AgentRuntime:
         function = tool_call.get("function", {})
         name = function.get("name")
         tool_call_id = tool_call.get("id", "unknown_tool_call")
-        if name != "retrieve_memory":
+        if name not in self.handlers:
             content = {"error": f"Unsupported tool: {name}"}
             if turn_logger:
                 turn_logger.record_tool_execution(
@@ -224,7 +340,8 @@ class AgentRuntime:
                 )
             return {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(content)}
 
-        tier = str(args.get("tier", "all")).lower()
+        # retrieve_memory는 tier로, search_documents는 stage로 범위를 좁힌다.
+        tier = str(args.get("tier") or args.get("stage") or "all").lower()
         query = str(args.get("query", "")).strip()
         self._emit(
             event_callback,
@@ -242,7 +359,7 @@ class AgentRuntime:
                 "reason": args.get("reason", ""),
             },
         )
-        repeat_key = (tier, query.lower())
+        repeat_key = (str(name), tier, query.lower())
         if repeat_key in seen_tier_queries:
             result = {
                 "query": query,
@@ -253,12 +370,7 @@ class AgentRuntime:
             }
         else:
             seen_tier_queries.add(repeat_key)
-            result = self.memory_store.retrieve(
-                tier=tier,
-                query=query,
-                filters=args.get("filters") or {},
-                top_k=int(args.get("top_k") or self.config.default_top_k),
-            )
+            result = self.handlers[name](args)
         self._emit(
             event_callback,
             turn_logger,
@@ -284,7 +396,7 @@ class AgentRuntime:
         if turn_logger:
             turn_logger.record_tool_execution(
                 {
-                    "tool": "retrieve_memory",
+                    "tool": name,
                     "tool_call_id": tool_call_id,
                     "status": "completed",
                     "tier": tier,
@@ -300,7 +412,7 @@ class AgentRuntime:
 
         trace.tool_calls.append(
             {
-                "tool": "retrieve_memory",
+                "tool": name,
                 "tier": tier,
                 "query": query,
                 "reason": args.get("reason", ""),
@@ -311,19 +423,108 @@ class AgentRuntime:
             source = card.get("source_ref", {}).get("document_id")
             if source and source not in trace.final_sources:
                 trace.final_sources.append(source)
+            if card.get("record_id"):
+                trace.cards.append({"tool": str(name), **card})
 
         return {
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "name": "retrieve_memory",
+            "name": name,
             "content": json.dumps(result, ensure_ascii=False),
         }
+
+    def _score_attribution(self, answer: str, trace: AgentTrace) -> None:
+        """최종 답변에 각 근거가 얼마나 반영됐는지를 실수로 매기고 누적한다.
+
+        조회수(+1)는 검색에 걸렸다는 사실만 남긴다. 여기서 계산하는 influence는 답변
+        텍스트 중 그 근거로 설명되는 비중이라, 반환됐지만 무시된 근거를 걸러낸다.
+        메모리 계층 카드만 누적한다 — 문서 코퍼스(LTM)는 승격 대상이 아니다.
+        """
+        if not trace.cards:
+            return
+
+        # 같은 기록이 여러 번 반환됐으면 한 장으로 합친다. 중복 카운트를 막는다.
+        merged: dict[str, dict[str, Any]] = {}
+        for card in trace.cards:
+            rid = card["record_id"]
+            if rid not in merged:
+                merged[rid] = card
+
+        payload = []
+        for rid, card in merged.items():
+            ref = card.get("source_ref", {})
+            payload.append({
+                "record_id": rid,
+                "source": "memory" if card["tool"] == "memory_pipeline" else "documents",
+                "label": card.get("title") or ref.get("document_id", rid),
+                "text": card.get("content") or card.get("quote") or card.get("summary", ""),
+            })
+
+        scores = attribute(answer, payload, embed_fn=self._embedder())
+        trace.attribution_method = scores[0].method if scores else ""
+        trace.attribution = [
+            {
+                "record_id": s.record_id,
+                "source": s.source,
+                "label": s.label,
+                "influence": s.influence,
+            }
+            for s in sorted(scores, key=lambda x: x.influence, reverse=True)
+        ]
+
+        for s in scores:
+            if s.source == "memory":
+                self.memory.credit(s.record_id, s.influence)
+
+    def _record_to_stm(self, question: str, answer: str, result: dict[str, Any]) -> None:
+        """방금 나눈 대화를 STM에 남기고 메모리를 다시 읽는다.
+
+        재적재를 같이 하는 이유는 대화형 모드다. 다음 턴의 메모리 프리페치가 방금
+        저장한 기록을 봐야 "아까 그거"가 성립한다.
+        """
+        if self.recorder is None:
+            return
+        try:
+            info = self.recorder.record_turn(question, answer)
+            result["stm_facts_added"] = info["facts_added"]
+            result["stm_fact_ids"] = info["fact_ids"]
+            result["raw_log_path"] = info["raw"]
+        except Exception as exc:  # noqa: BLE001 - 기록 실패가 답변을 막으면 안 된다
+            result["stm_record_error"] = f"{type(exc).__name__}: {exc}"
+
+    def _check_promotion(self, trace: AgentTrace, result: dict[str, Any]) -> None:
+        """이번 턴이 끝날 때 STM -> MTM 승격 여부를 즉시 확인한다.
+
+        승격 조건(조회수 >= 임계치)을 이번 턴에 건드린 사실만 확인한다 — 이번 턴에
+        새로 추출된 사실(방금 막 생겼으니 조회수 0, 대부분 해당 안 됨)과 이번 턴
+        답변에 실제로 인용돼 조회수가 오른 기존 사실(대부분 여기서 걸림). 나머지
+        STM 전체를 매 턴 훑지 않는다 — memory_promote.promote_touched()가 그렇게
+        짜여 있다.
+
+        폐기·MTM 중복 정리는 대화 흐름과 무관한 유지보수라 여기서 하지 않는다.
+        memory_promote.run()을 배치로 별도 실행해서 처리한다.
+        """
+        touched = set(result.get("stm_fact_ids") or [])
+        touched.update(
+            a["record_id"] for a in trace.attribution if a["source"] == "memory"
+        )
+        if not touched:
+            return
+        try:
+            counts = memory_promote.promote_touched(self.memory, list(touched))
+            if counts["add"] or counts["update"]:
+                result["promoted"] = counts
+        except Exception as exc:  # noqa: BLE001 - 승격 실패가 답변을 막으면 안 된다
+            result["promotion_error"] = f"{type(exc).__name__}: {exc}"
 
     def _trace_dict(self, trace: AgentTrace) -> dict[str, Any]:
         return {
             "llm_calls": trace.llm_calls,
+            "memory_prefetch": trace.memory_prefetch,
             "tool_calls": trace.tool_calls,
             "final_sources": trace.final_sources,
+            "attribution": trace.attribution,
+            "attribution_method": trace.attribution_method,
             "stopped_reason": trace.stopped_reason,
         }
 
@@ -374,7 +575,7 @@ class AgentRuntime:
         return {
             "tool_call_id": tool_call.get("id", "unknown_tool_call"),
             "tool": function.get("name", ""),
-            "tier": args.get("tier", ""),
+            "tier": args.get("tier", args.get("stage", "")),
             "query": args.get("query", ""),
             "filters": args.get("filters") or {},
             "top_k": args.get("top_k", self.config.default_top_k),

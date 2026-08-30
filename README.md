@@ -35,7 +35,7 @@ python -m org_agent_mvp --verbose --trace --question "아까 회의에서 다음
 기본 모델:
 
 ```env
-OPENROUTER_MODEL=google/gemma-4-31b-it:free
+OPENROUTER_MODEL=google/gemini-3.7-flash
 ```
 
 ## Useful Options

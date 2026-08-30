@@ -42,5 +42,13 @@ class OpenRouterClient:
             raise RuntimeError(f"OpenRouter HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
+
+        # OpenRouter는 오류를 HTTP 200 본문에 담아 보내는 경우가 있다(업스트림 제공자
+        # 오류, 레이트리밋 등). 그대로 두면 KeyError: 'choices'로 원인이 가려진다.
+        if "choices" not in data:
+            detail = data.get("error") or data
+            raise RuntimeError(
+                f"OpenRouter returned no choices: {json.dumps(detail, ensure_ascii=False)[:500]}"
+            )
         return data["choices"][0]["message"]
 
