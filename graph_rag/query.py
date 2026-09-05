@@ -67,7 +67,11 @@ class GraphRetriever:
             raise FileNotFoundError(
                 f"그래프 인덱스가 없습니다: {db_path}. `python -m graph_rag.build` 실행 필요."
             )
-        self.conn = sqlite3.connect(db_path)
+        # check_same_thread=False: GraphSearchTool이 이 인스턴스를 캐시해 두고
+        # 재사용하는데, 웹 서버(chat_server)처럼 요청마다 스레드가 바뀌는 곳에서는
+        # 만들어진 스레드가 아닌 다른 스레드에서 계속 쓰이게 된다. 동시 접근
+        # 직렬화는 호출부(chat_server의 _lock)가 책임진다.
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._surface = self._surface_map()
         self._embedder = None

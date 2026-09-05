@@ -13,10 +13,16 @@ from .embedder import EmbeddingCache, _hash_text
 
 
 class LocalEmbedder:
-    def __init__(self, model_id: str, device: str = "cuda", batch_size: int = 32):
+    def __init__(self, model_id: str, device: str = "cuda", batch_size: int = 32,
+                 max_seq_length: int | None = None):
         self.model_id = model_id
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         self.model = SentenceTransformer(model_id, device=self.device, trust_remote_code=True)
+        if max_seq_length is not None:
+            # 모델 기본 max_seq_length(예: arctic-ko의 8192)를 그대로 두면 어텐션
+            # 메모리가 시퀀스 길이 제곱에 비례해 낭비된다. 실제 코퍼스 청크가 다
+            # 이 값보다 짧으면 내용은 안 잘리고 메모리·연산만 준다.
+            self.model.max_seq_length = max_seq_length
         self.batch_size = batch_size
         self.cache = EmbeddingCache(model_id)
 

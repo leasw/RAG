@@ -1295,6 +1295,90 @@
       "user_turns": 1,
       "file": "s-live-20260827-202152-72d37d.jsonl",
       "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-162044-05c5e7",
+      "title": "응애",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T16:21:00",
+      "end_ts": "2026-09-03T16:23:00",
+      "turn_count": 6,
+      "user_turns": 3,
+      "file": "s-live-20260903-162044-05c5e7.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-164458-ec97f0",
+      "title": "who is the project lead at Gachon Univer",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T16:46:00",
+      "end_ts": "2026-09-03T16:46:00",
+      "turn_count": 2,
+      "user_turns": 1,
+      "file": "s-live-20260903-164458-ec97f0.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-165606-860c85",
+      "title": "가천대 시각장애인 관련 분야 연구 수행 내역 정리",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T16:58:00",
+      "end_ts": "2026-09-03T17:03:00",
+      "turn_count": 8,
+      "user_turns": 4,
+      "file": "s-live-20260903-165606-860c85.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-171229-701242",
+      "title": "가천대 시각장애인 관련 분야 연구 수행 내역 정리",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T17:20:00",
+      "end_ts": "2026-09-03T17:23:00",
+      "turn_count": 6,
+      "user_turns": 3,
+      "file": "s-live-20260903-171229-701242.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-172723-fd468a",
+      "title": "가천대 시각장애인 관련 분야 연구 수행 내역 정리",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T17:49:00",
+      "end_ts": "2026-09-03T17:54:00",
+      "turn_count": 6,
+      "user_turns": 3,
+      "file": "s-live-20260903-172723-fd468a.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-180359-0a6647",
+      "title": "가천대학교 시각장애인 관련 분야 연구 수행 내역 정리해줘",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T18:04:00",
+      "end_ts": "2026-09-03T18:04:00",
+      "turn_count": 2,
+      "user_turns": 1,
+      "file": "s-live-20260903-180359-0a6647.jsonl",
+      "origin": "live"
+    },
+    {
+      "session_id": "s-live-20260903-180609-c4d725",
+      "title": "who is the project lead at Gachon Univer",
+      "user": "user",
+      "date": "2026-09-03",
+      "start_ts": "2026-09-03T18:06:00",
+      "end_ts": "2026-09-03T19:32:00",
+      "turn_count": 6,
+      "user_turns": 3,
+      "file": "s-live-20260903-180609-c4d725.jsonl",
+      "origin": "live"
     }
   ],
   "note": "s-live-* 는 에이전트와 실제로 나눈 대화, 그 밖은 가상 생성 데이터."

@@ -8,8 +8,25 @@ overlap을 config의 chunking.by_format에서 다르게 줍니다.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterator
+
+# HWP -> 마크다운(_table_to_markdown) -> Docling(InputFormat.MD 재입력) -> HybridChunker
+# 경로에서, Docling이 표를 다시 파싱해 contextualize()로 직렬화할 때 인접한 표 행
+# 사이의 줄바꿈이 사라지는 경우가 있다("...환경 ||---|---|| 14 |..."처럼 헤더·구분선·
+# 본문행이 한 줄로 눌어붙음). 실측(.scratch/audit_hwp_chunks.py)으로 hwp 표 청크의
+# 6.9%(770/11,172)가 이 문제였다.
+#
+# 우리가 만드는 표 행은 "| " + " | ".join(cells) + " |" 형태라, 빈 셀도 파이프 사이에
+# 공백이 낀다("|  |"). 그래서 공백 없이 파이프가 바로 붙는 "||"는 정상 표에서는 절대
+# 나올 수 없고, 오직 이 행-경계 유실 버그에서만 나타난다 — 안전하게 구분 가능한 신호다.
+_GLUED_PIPE_RE = re.compile(r"\|(?=\|)")
+
+
+def _repair_glued_table_rows(text: str) -> str:
+    """인접한 '|'와 '|' 사이에 줄바꿈을 되돌려 넣어 눌어붙은 표 행을 되살린다."""
+    return _GLUED_PIPE_RE.sub("|\n", text)
 
 
 @dataclass
@@ -64,7 +81,7 @@ class ChunkerBank:
 
         prev_tail = ""
         for item in raw:
-            body = chunker.contextualize(chunk=item)
+            body = _repair_glued_table_rows(chunker.contextualize(chunk=item))
             if len(body.strip()) < self.min_chars:
                 prev_tail = ""
                 continue

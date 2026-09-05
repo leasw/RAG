@@ -1,0 +1,111 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 8958.15it/s]
+{
+  "nodes": {
+    "Document": 695,
+    "Organization": 12,
+    "Product": 10,
+    "Metric": 7,
+    "Person": 7,
+    "Task": 7,
+    "Project": 1
+  },
+  "edges": {
+    "MENTIONS": 3679,
+    "CO_OCCURS": 372,
+    "PART_OF": 7,
+    "HAS_PART": 7,
+    "BELONGS_TO": 6,
+    "PARTICIPATES_IN": 2,
+    "HAS_VERSION": 2
+  },
+  "top_mentioned": [
+    {
+      "label": "Low Vision Smart Glass",
+      "type": "Product",
+      "mentions": 10441,
+      "docs": 404
+    },
+    {
+      "label": "가천대학교 산학협력단",
+      "type": "Organization",
+      "mentions": 6111,
+      "docs": 460
+    },
+    {
+      "label": "주식회사 피씨티",
+      "type": "Organization",
+      "mentions": 5298,
+      "docs": 250
+    },
+    {
+      "label": "HMD",
+      "type": "Product",
+      "mentions": 4544,
+      "docs": 144
+    },
+    {
+      "label": "비대면 실내외 활동보조",
+      "type": "Task",
+      "mentions": 2157,
+      "docs": 104
+    },
+    {
+      "label": "시기능 인지 능력 발달 훈련",
+      "type": "Task",
+      "mentions": 1796,
+      "docs": 90
+    },
+    {
+      "label": "조진수",
+      "type": "Person",
+      "mentions": 1298,
+      "docs": 301
+    },
+    {
+      "label": "증강현실 시각보정",
+      "type": "Task",
+      "mentions": 1239,
+      "docs": 113
+    },
+    {
+      "label": "도우미 서비스",
+      "type": "Task",
+      "mentions": 821,
+      "docs": 93
+    },
+    {
+      "label": "정정일",
+      "type": "Person",
+      "mentions": 817,
+      "docs": 197
+    },
+    {
+      "label": "장애물 감지",
+      "type": "Task",
+      "mentions": 618,
+      "docs": 106
+    },
+    {
+      "label": "보행 위험감지 보조",
+      "type": "Task",
+      "mentions": 582,
+      "docs": 84
+    }
+  ],
+  "isolated": [
+    "태창특허법률사무소"
+  ],
+  "disambiguation": {
+    "enabled": true,
+    "rejected_mentions": {
+      "product:lvsg": 1338,
+      "product:hmd": 120
+    }
+  },
+  "semantic_index": {
+    "enabled": true,
+    "entities": 43,
+    "dim": 768
+  }
+}

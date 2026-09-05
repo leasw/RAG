@@ -49,9 +49,15 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
 from .config import AppConfig
 from .fact_memory import FactMemory
+from .openrouter_client import OpenRouterClient
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW_CHAT = ROOT / "data" / "raw" / "chat"
+RAW_AI = ROOT / "data" / "raw" / "ai_chat"
 
 # STM 최신성 창. fact_memory와 같은 값을 써야 한다 — 그쪽은 진입 자격을,
 # 여기서는 승격 심사 대상을 가른다.
@@ -92,6 +98,20 @@ UPDATE_SCORE = 2.0
 
 # 리랭커에 넘길 MTM 후보 수. 코사인으로 먼저 추린다.
 UPDATE_CANDIDATES = 5
+
+# LTM 갱신(같은 사안·다른 정보) 판정의 하한. 위 실측 각주의 정정 사례가 -1.34 ~
+# -4.16에 있었고, 완전히 무관한 사실은 -11.04까지 떨어졌다. 상호함의가 이 밑으로
+# 내려가면 "같은 사안의 최신 정보"가 아니라 "코사인만 우연히 겹친 무관한 문장"으로
+# 본다 — 실측에서 코사인 0.85인데 상호함의 -7.65인 완전 무관 쌍(엔티티 담당자 변경
+# vs 전담기관명)이 나와서 하한 없이는 엉뚱한 갱신이 발생했다.
+UPDATE_FLOOR = -6.0
+
+# (과거) LTM(문서 코퍼스) 보유 여부를 가르던 리랭커 점수 문턱 — 문서에 있음
+# +2.709~+4.714 / 채팅에만 -4.473~-0.613, 격차 3.3으로 실측했었다. doc_rag의
+# search_documents 경로에서 리랭커를 없앤 뒤로는 이 문턱이 더 이상 안 맞는
+# 점수 스케일(RRF 점수, 항상 작은 양수)에 적용될 판이라 삭제했다 —
+# `_doc_corroboration()`이 이제 "있다/없다"를 숫자로 확정하지 않고 최상위 후보
+# 문서 조각을 그대로 LLM에게 넘겨 직접 판단하게 한다.
 
 
 def _cluster(memory: FactMemory, aged: list, seeds: list,
@@ -197,13 +217,24 @@ def _promote_facts(memory: FactMemory, facts: list, judge: _Judge,
     return counts
 
 
-def _dedup_mtm(memory: FactMemory, judge: "_Judge", dry_run: bool) -> int:
-    """MTM 안의 중복을 찾아 하나로 합친다(DELETE).
+def _dedup_tier(memory: FactMemory, tier: str, judge: "_Judge", dry_run: bool,
+                only_ids: set[str] | None = None) -> int:
+    """그 계층 안의 중복을 찾아 하나로 합친다(DELETE). STM->MTM(mtm)에도,
+    MTM->LTM(ltm)에도 같은 로직을 쓴다 — "같은 사실인가" 판정 자체는 계층과 무관하다.
 
     조회수가 높은 쪽을 남긴다. 실제로 답변에 쓰인 표현이 그쪽이기 때문이다.
     지워지는 쪽의 조회수는 남는 쪽으로 넘어간다.
+
+    only_ids를 주면 비교 대상을 그 id들로만 좁힌다. LTM에서 이게 중요한 이유가
+    있다 — only_ids 없이 tier 전체를 훑으면, 방금 승격된 사실이 예전부터 있던
+    LTM 사실과 (리랭커 오판으로) 잘못 병합돼 이미 검증된 기존 레코드가 지워질
+    위험이 있다. LTM은 STM/MTM과 달리 "이미 확정된" 계층이라 이 위험을 감수할
+    이유가 없다 — 그래서 promote_to_ltm()은 이번에 새로 승격된 것들끼리만
+    비교하도록 이 인자를 넘긴다. STM->MTM 쪽은 그런 우려가 없어 tier 전체를 본다.
     """
-    facts = memory.all_facts("mtm")
+    facts = memory.all_facts(tier)
+    if only_ids is not None:
+        facts = [f for f in facts if f.id in only_ids]
     if len(facts) < 2 or judge.reranker is None:
         return 0
     vecs = memory.vectors_for(facts)
@@ -238,6 +269,73 @@ def _dedup_mtm(memory: FactMemory, judge: "_Judge", dry_run: bool) -> int:
             memory.absorb(keeper.id, [v.id for v, _ in victims])
         total += len(victims)
     return total
+
+
+def _resolve_against_ltm(memory: FactMemory, candidates: list, judge: "_Judge",
+                          sim_threshold: float = SIM_THRESHOLD) -> dict:
+    """승격 후보마다 **기존** LTM(이번에 새로 승격되는 것들 말고, 이미 있던 것)과
+    비교해서 신규 승격/중복 폐기/기존 갱신 셋 중 하나로 정한다.
+
+    기존 LTM 레코드는 여기서 지우거나 합치지(absorb) 않는다 — 오직 UPDATE 케이스에서만
+    문장을 갈아끼운다(그것도 "같은 사안, 최신 정보로 교체"라는 명시적 의도가 있을 때만).
+    _dedup_tier()의 흡수 병합과 달리, 여기는 리랭커 오판으로 기존 레코드가 통째로
+    지워질 경로 자체가 없다.
+
+    코사인(주제 유사)과 상호함의(내용 일치)를 따로 본다:
+
+        코사인 < sim_threshold                          무관한 사안 -> 신규 승격
+        상호함의 >= min_score                            같은 사실 -> 중복, 후보 폐기
+        UPDATE_FLOOR <= 상호함의 < min_score              같은 사안·다른 정보
+                                                          -> 최신 정보로 기존 LTM 갱신
+        상호함의 < UPDATE_FLOOR                           코사인만 겹친 무관한 사실 -> 신규 승격
+
+    코사인은 "리랭커에 돌릴 후보를 추리는 1차 필터"일 뿐 그 자체로 "같은 사안"을
+    확정하지 않는다 — 짧은 한국어 문장은 표면 단어가 겹치면 주제가 달라도 코사인이
+    쉽게 0.8대까지 올라간다. 최종 판단은 항상 상호함의(내용) 쪽이 한다.
+    """
+    new_ids: list[str] = []
+    updated: list[dict] = []
+    rejected: list[dict] = []
+
+    existing = memory.all_facts("ltm")
+    if not existing or judge.reranker is None:
+        return {"new": [f.id for f in candidates], "updated": [], "rejected": []}
+
+    cand_vecs = memory.vectors_for(candidates)
+    exist_vecs = memory.vectors_for(existing)
+    if cand_vecs is None or exist_vecs is None:
+        return {"new": [f.id for f in candidates], "updated": [], "rejected": []}
+
+    for i, f in enumerate(candidates):
+        sims = exist_vecs @ cand_vecs[i]
+        best_j, best_cos = None, sim_threshold
+        for j in range(len(existing)):
+            cos = float(sims[j])
+            if cos >= best_cos:
+                best_j, best_cos = j, cos
+        if best_j is None:
+            new_ids.append(f.id)
+            continue
+
+        target = existing[best_j]
+        score = judge._mutual(f.text, target.text)
+        if score >= judge.min_score:
+            print(f"  [중복] LTM에 이미 있음 (상호함의 {score:+.2f}) -> 승격 취소: {f.text[:52]}")
+            print(f"      기존: {target.text[:60]}")
+            rejected.append({"id": f.id, "text": f.text, "matched_ltm_id": target.id, "score": score})
+        elif score >= UPDATE_FLOOR:
+            print(f"  [갱신] 같은 사안·다른 정보 (코사인 {best_cos:.2f} / 상호함의 {score:+.2f}) "
+                  f"-> LTM 갱신: {f.text[:52]}")
+            print(f"      기존: {target.text[:60]}")
+            updated.append({"id": f.id, "text": f.text, "target_id": target.id, "score": score})
+        else:
+            # 코사인은 겹쳤지만 상호함의가 바닥까지 떨어짐 -> 표면 단어만 겹친
+            # 무관한 사실. "같은 사안"이 아니므로 갱신 대상이 아니라 신규로 본다.
+            print(f"  [무관] 코사인만 겹침 (코사인 {best_cos:.2f} / 상호함의 {score:+.2f}) "
+                  f"-> 신규 승격: {f.text[:52]}")
+            new_ids.append(f.id)
+
+    return {"new": new_ids, "updated": updated, "rejected": rejected}
 
 
 def promote_touched(memory: FactMemory, fact_ids: list[str],
@@ -329,11 +427,192 @@ def run(min_views: float = DEFAULT_MIN_VIEWS, window_days: int = STM_WINDOW_DAYS
     result["dropped"] = len(evictable)
 
     # MTM 안에 남아 있는 중복 정리. 승격 판정이 1:1이라 여기서만 잡힌다.
-    result["deleted"] = _dedup_mtm(memory, judge, dry_run)
+    result["deleted"] = _dedup_tier(memory, "mtm", judge, dry_run)
 
     if dry_run:
         print("\n(dry-run: 아무것도 바꾸지 않았습니다)")
     print("\n[계층 상태]", json.dumps(memory.stats(), ensure_ascii=False))
+    return result
+
+
+def _fact_source_traceable(f) -> bool:
+    """f.source_id가 실제 원문 로그 파일로 이어지는지 데이터로 확인한다.
+
+    LLM 판단이 아니다 — LLM에게 "출처가 있어 보이나?"를 물으면 그럴듯한 텍스트를
+    보고 있다고 답할 수 있어서, 출처만큼은 파일 존재 여부로 직접 검증한다.
+    """
+    if not f.source_id:
+        return False
+    path = (RAW_CHAT if f.source_type == "team_chat" else RAW_AI) / f"{f.source_id}.jsonl"
+    return path.exists()
+
+
+_LTM_JUDGE_PROMPT = """다음은 한 조직의 채팅에서 뽑혀 반복적으로 참조된 사실 문장이다.
+이 사실은 문서 코퍼스(공식 문서)에 {doc_status}.
+
+"{text}"
+
+두 가지를 판정해라.
+
+1. truthful: 이 문장이 구체적이고 검증 가능한 형태로 서술돼 있는가(모호한 추측이나
+   근거 없는 소문이 아닌가). 문서 근거가 없어도, 채팅에서 구체적 수치·이름·결정으로
+   명확히 진술됐다면 truthful로 볼 수 있다.
+2. useful: 앞으로도 반복적으로 참조될 실질적 가치가 있는가(단발성 잡담이나 이미
+   끝난 일회성 조치가 아닌가. "내일까지", "이번 주" 같은 시한부 표현이 핵심이면
+   대개 useful=false다).
+
+반드시 이 형식의 JSON만 출력해라:
+{{"truthful": true/false, "useful": true/false,
+  "reason": "한 문장으로 각 판정 근거 요약"}}"""
+
+
+def _parse_ltm_judgment(text: str) -> dict:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        return {}
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
+
+
+def _doc_corroboration(retriever, fact_text: str) -> tuple[float | None, str]:
+    """문서 코퍼스에서 가장 가까운 근거를 찾아 LLM 판정에 힌트로 준다.
+
+    **리랭커 제거 이후로 "있다/없다"를 확신 있게 못 가른다.** doc_rag/retriever.py가
+    더 이상 리랭커를 안 써서(D:/RAG 벤치마크 실측 결과 — 300M 리랭커가 RRF 단독보다
+    오히려 nDCG를 깎았다), `search()`가 돌려주는 점수는 리랭커 로짓이 아니라 RRF
+    점수(항상 작은 양수, 0.01~0.03대)다. 옛 문턱(LTM_COVERED_SCORE=0.0, "문서에
+    있음 +2.7~+4.7 / 채팅에만 -4.5~-0.6" 실측으로 잡은 값)은 이제 스케일이 안 맞아
+    아무 의미가 없다 — RRF 점수는 전부 그 문턱보다 크다.
+
+    그래서 "근거가 있다/없다"를 확정하는 대신, 최상위 후보 청크의 본문 일부를
+    그대로 인용해서 LLM에게 넘긴다. 실제로 그 사실을 뒷받침하는지는 문장을 읽은
+    LLM이 판단하게 한다 — 우리가 숫자로 확신할 근거가 없어졌기 때문이다.
+    """
+    if retriever is None:
+        return None, "확인 불가(문서 검색기 없음)"
+    try:
+        hits = retriever.search(fact_text, top_k=1)
+    except Exception:  # noqa: BLE001
+        hits = []
+    if not hits:
+        return None, "관련 문서를 못 찾음"
+    snippet = hits[0]["text"][:200].replace("\n", " ")
+    return hits[0]["score"], f'가장 관련성 높은 문서 조각: "{snippet}..." (이게 이 사실을 실제로 뒷받침하는지는 직접 판단할 것)'
+
+
+def promote_to_ltm(memory: FactMemory, client: OpenRouterClient | None = None,
+                   dry_run: bool = False) -> dict:
+    """MTM -> LTM 승격. 3개 기준(출처·진실성·유용성)을 전부 통과해야 승격된다.
+
+    공유적합성(shareable) 기준은 뺐다 — 원래 H6에 있었지만 (사용자 지시로) 제거함.
+    실측에서도 이게 병목이었던 적이 없다(traceable/truthful/useful 세 개는 종종
+    실패가 났는데 shareable은 거의 항상 통과했다).
+
+    **알려진 한계 (2026-09-03 인계 문서에서 지적됨, 해소 안 됨):**
+
+    이 기준들의 판정 품질을 검증할 진짜 정답셋이 없다. `.scratch/sim_ltm_promotion*.py`
+    에서 5개 가설(조회수 임계, 활용률, LLM 내구성 판정 등)을 만들어 비교해봤지만, 그때
+    "기준선"으로 쓴 것도 결국 또 다른 LLM 프롬프트였다 — 사람이 라벨링한 것도, 승격 후
+    실제로 재참조됐는지 추적한 것도 아니다. 게다가 그 기준선이 조회수·활용률 수치를
+    입력으로 받았기 때문에, 조회수 기반 가설들과 비교한 결과는 순환논리였다(채점 기준이
+    응시자의 답안을 미리 본 셈).
+
+    이 함수가 쓰는 기준(H6에서 shareable을 뺀 것)은 그 문제에서 상대적으로 자유롭다 —
+    truthful/useful 판정에 조회수·활용률을 프롬프트에 안 준다. 다만 여전히 LLM 판정이고,
+    사람 라벨이나 사후 재참조 추적으로 검증된 적은 없다. **운영 시작점이지 확정값이 아니다.**
+
+        출처(traceable)  source_id가 실제 원문 로그 파일로 이어지는가 (데이터로 확인)
+        진실성(truthful)  구체적·검증 가능한 서술인가 (LLM 판정, 문서 근거 여부를 힌트로 줌)
+        유용성(useful)    앞으로도 반복 참조될 가치가 있는가 (LLM 판정)
+
+    셋 다 True여야 승격한다. 하나라도 실패하면 MTM에 그대로 남는다.
+    """
+    if client is None:
+        config = AppConfig.load()
+        client = OpenRouterClient(config)
+
+    retriever = None
+    try:
+        from doc_rag.retriever import DocRetriever
+        retriever = DocRetriever()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (문서 근거 확인 불가 — {type(exc).__name__}: {exc}. truthful 판정에서 힌트 없이 진행)")
+
+    facts = memory.all_facts("mtm")
+    print(f"MTM {len(facts)}건 대상 LTM 승격 심사 (기준: 출처 AND 진실성 AND 유용성)")
+
+    promoted, rows = [], []
+    for f in facts:
+        traceable = _fact_source_traceable(f)
+        _doc_score, doc_status = _doc_corroboration(retriever, f.text)
+        msg = client.chat(
+            [{"role": "system", "content": "너는 JSON만 출력하는 판정기다."},
+             {"role": "user", "content": _LTM_JUDGE_PROMPT.format(text=f.text, doc_status=doc_status)}],
+            tools=[],
+        )
+        judged = _parse_ltm_judgment(msg.get("content"))
+        truthful = bool(judged.get("truthful", False))
+        useful = bool(judged.get("useful", False))
+        ok = traceable and truthful and useful
+        rows.append({"id": f.id, "text": f.text, "traceable": traceable,
+                     "truthful": truthful, "useful": useful,
+                     "reason": judged.get("reason", "")})
+        flags = "".join(["출" if traceable else "-", "진" if truthful else "-",
+                         "유" if useful else "-"])
+        print(f"  [{flags}] {'PROMOTE' if ok else 'hold':7s} {f.text[:56]}")
+        if ok:
+            promoted.append(f.id)
+
+    result = {"examined": len(facts), "promoted": 0, "rows": rows,
+              "rejected_duplicate": 0, "updated_existing": 0}
+
+    # 3개 기준을 통과한 후보라도 그대로 다 새 LTM 레코드로 올리지 않는다. 승격
+    # 판정이 사실 하나씩 독립적이라, "가천대학교 소속 참여연구원 알려줘"와
+    # "가천대산학협력단이랑 관련된 연구원이 누구야"처럼 다른 질문에서 나온 같은
+    # 내용이 둘 다 통과하면 LTM에 중복이 쌓인다. 그래서 이번에 새로 승격되는
+    # 후보끼리 서로 병합(흡수)하는 게 아니라, **각 후보를 기존 LTM과 대조**해서
+    # 판정한다 — 이미 있으면(중복) 후보를 버리고, 같은 사안인데 정보가 다르면
+    # (최신화) 기존 LTM 레코드 문장을 갈아끼우고, 무관하면 그대로 새로 올린다.
+    # 기존 LTM 레코드를 흡수 삭제하는 경로는 없어서, 리랭커 오판으로 확정된
+    # 레코드가 통째로 사라질 위험이 없다.
+    if promoted:
+        by_id = {f.id: f for f in facts}
+        candidates = [by_id[fid] for fid in promoted]
+        judge = _Judge(memory, UPDATE_SCORE, UPDATE_CANDIDATES)
+        resolution = _resolve_against_ltm(memory, candidates, judge)
+
+        if not dry_run:
+            if resolution["new"]:
+                memory.retier(resolution["new"], "ltm")
+            for u in resolution["updated"]:
+                memory.update_fact(u["target_id"], u["text"],
+                                    add_views=by_id[u["id"]].views,
+                                    add_returns=by_id[u["id"]].returns)
+                memory.drop([u["id"]])
+            if resolution["rejected"]:
+                memory.drop([r["id"] for r in resolution["rejected"]])
+
+        result["promoted"] = len(resolution["new"])
+        result["rejected_duplicate"] = len(resolution["rejected"])
+        result["updated_existing"] = len(resolution["updated"])
+
+    if dry_run:
+        print("\n(dry-run: 아무것도 바꾸지 않았습니다 — 기존 LTM 대조도 승격 후보 확정 뒤에만 도니 여기선 확인 못 함)")
+    extra = []
+    if result["rejected_duplicate"]:
+        extra.append(f"중복 폐기 {result['rejected_duplicate']}건")
+    if result["updated_existing"]:
+        extra.append(f"기존 갱신 {result['updated_existing']}건")
+    suffix = f" ({', '.join(extra)})" if extra else ""
+    print(f"\nLTM 승격: {result['promoted']}/{len(facts)}건{suffix}")
+    print("[계층 상태]", json.dumps(memory.stats(), ensure_ascii=False))
     return result
 
 
@@ -350,6 +629,8 @@ def main() -> int:
                     help="MTM 기존 사실과 같다고 보아 UPDATE할 상호함의 문턱.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--ltm", action="store_true",
+                    help="STM->MTM 대신 MTM->LTM 승격을 실행한다(출처/진실성/공유적합성/유용성, LLM 판정 포함).")
     args = ap.parse_args()
 
     config = AppConfig.load()
@@ -359,6 +640,11 @@ def main() -> int:
         for f in memory.all_facts():
             print(f"  [{f.tier}] views={f.views:6.3f} ret={f.returns:2d} "
                   f"{f.date} {f.text[:70]}")
+        return 0
+
+    if args.ltm:
+        memory = FactMemory(config.memory_root, track_access=False)
+        promote_to_ltm(memory, dry_run=args.dry_run)
         return 0
 
     run(min_views=args.min_views, window_days=args.window_days,

@@ -10,3 +10,8 @@ __pycache__/
 # 재생성 가능한 대용량 생성물 (100MB 초과, doc_rag.build_index로 재생성)
 cache/
 index/doc_rag/embeddings.npy
+
+# 문서 코퍼스 전체 텍스트를 그대로 복제한 1회성 점검용 덤프 (원본은 index/doc_rag/chunks.sqlite3에 이미 있음)
+.scratch/parsed_chunks.json
+.scratch/parsed_chunks.jsonl
+.scratch/parsed_chunks_shards/

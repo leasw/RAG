@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8811", "--directory", "viewer"],
       "port": 8811
+    },
+    {
+      "name": "agent-chat",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "chat_server.server"],
+      "port": 8812
     }
   ]
 }

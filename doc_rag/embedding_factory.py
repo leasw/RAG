@@ -23,7 +23,7 @@ def _key(cfg: dict) -> tuple:
     emb = cfg["embedding"]
     backend = emb.get("backend", "local")
     return (backend, emb["id"], emb.get("device", "cuda"),
-            int(emb.get("batch_size", 32)))
+            int(emb.get("batch_size", 32)), emb.get("max_seq_length"))
 
 
 def build_embedder(cfg: dict, api_key: str | None = None, reuse: bool = True):
@@ -42,6 +42,7 @@ def build_embedder(cfg: dict, api_key: str | None = None, reuse: bool = True):
             emb["id"],
             device=emb.get("device", "cuda"),
             batch_size=int(emb.get("batch_size", 32)),
+            max_seq_length=emb.get("max_seq_length"),
         )
     elif backend == "openrouter":
         from .config import get_api_key

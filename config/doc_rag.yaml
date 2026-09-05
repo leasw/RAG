@@ -24,25 +24,32 @@ openrouter:
   batch_size: 32
 
 embedding:
-  # 500M급 로컬 임베딩 모델로 고정. D:/RAG 벤치마크의 로컬 모델 4종(모두 ~560-568M)
-  # 중 한국어 성적이 가장 좋았다 — nDCG@10 avg 0.8464 (KO-1 0.9615 / KO-2 0.8210).
-  #   arctic-ko 0.8464 > arctic-v2.0 0.8446 > mE5-large 0.8437 > KURE-v1 0.8421
-  # 로컬 GPU 추론이라 임베딩 API 비용/레이트리밋이 없고, 코퍼스 재빌드가 자유롭다.
+  # 300M급으로 축소(기존 arctic-ko 568M -> mE5-base 278M). 인계 문서(D:\Agent_RAG
+  # 세션)가 저사양 GPU 대응으로 이미 벤치마크한 조합을 그대로 채택했다 — mE5-base +
+  # bge-reranker-base 페어, "목적 탐지 4수단" 벤치마크에서 실측 완료된 조합이다.
+  # 정확도(nDCG)는 이전 568M 조합보다 낮을 걸로 예상되나 별도 재측정은 안 했다 —
+  # 그래프RAG/문서RAG의 실제 청크로 다시 재보든지, 품질 저하가 체감되면 원복할 것.
   backend: local            # local | openrouter
-  id: dragonkue/snowflake-arctic-embed-l-v2.0-ko
-  dimensions: 1024
+  id: intfloat/multilingual-e5-base
+  dimensions: 768
   device: cuda              # cuda 불가 시 cpu 자동 폴백
   batch_size: 32
-  # arctic-embed 계열은 비대칭 인코딩: query에만 prefix, passage는 prefix 없음.
+  max_seq_length: 512       # e5-base 기본 상한. 실측 청크 최대(811토큰)보다 짧아서
+                             # 긴 청크는 이 값에서 잘린다 -- arctic-ko(1024)와 다른 트레이드오프.
+  # E5 계열은 대칭 인코딩이지만 query/passage를 각각 라벨링해야 한다(비대칭 arctic과 다름).
   query_prefix: "query: "
-  passage_prefix: ""
+  passage_prefix: "passage: "
 
 reranker:
   backend: local            # local | openrouter
-  model_id: BAAI/bge-reranker-v2-m3
+  model_id: BAAI/bge-reranker-base
   device: cuda              # cuda 불가 시 cpu 자동 폴백
   batch_size: 16
-  max_length: 1024
+  # bge-reranker-base는 XLM-RoBERTa-base 기반이라 최대 포지션이 514다(512+특수토큰
+  # 2개). 이전 모델(bge-reranker-v2-m3, BGE-M3 기반이라 8192까지 지원)의 1024를
+  # 그대로 뒀다가 포지션 임베딩 테이블 밖을 참조해서 CUDA assert(scatter/gather
+  # index out of bounds)가 났다 — 실측으로 확인됨. 512로 낮춰서 안전 마진을 둔다.
+  max_length: 512
 
 chunking:
   # HybridChunker가 토큰 수를 세는 데 쓰는 토크나이저 (다국어/한국어)
@@ -67,8 +74,9 @@ retrieval:
   sparse_top_k: 30
   rrf_k: 60
   final_top_k: 5          # STM/MTM(retrieve_memory)의 top_k와 맞춘 값
-  # 리랭커 점수가 이 값 미만인 결과는 버립니다(무근거 답변 방지).
-  min_rerank_score: -4.0
+  # min_rerank_score는 더 이상 안 씀 -- 리랭커를 제거해서(retriever.py 참고) 걸러낼
+  # 리랭커 점수 자체가 없다. RRF 점수는 스케일이 달라(항상 작은 양수) 이 문턱
+  # 개념이 적용되지 않는다.
 
 ocr:
   # 텍스트 레이어가 없는 스캔 PDF에만 적용되는 폴백 OCR (EasyOCR).

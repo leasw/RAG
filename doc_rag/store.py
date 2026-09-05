@@ -49,7 +49,11 @@ class ChunkStore:
         self.db_path = index_dir / "chunks.sqlite3"
         self.vec_path = index_dir / "embeddings.npy"
         self.ids_path = index_dir / "chunk_ids.json"
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: 이 인스턴스가 웹 서버(chat_server)처럼 요청마다
+        # 스레드가 바뀌는 곳에서 재사용될 수 있다 — DocRetriever가 매번 새로 만들지
+        # 않고 캐시해 두기 때문에, 만들어진 스레드가 아닌 다른 스레드에서 계속
+        # 쓰인다. 동시 접근 직렬화는 호출부(chat_server의 _lock)가 책임진다.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 

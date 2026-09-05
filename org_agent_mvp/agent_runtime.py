@@ -13,7 +13,8 @@ from .prompts import SYSTEM_PROMPT
 from .attribution import attribute
 from .doc_rag_tool import DocSearchTool
 from .graph_tool import GraphSearchTool
-from .schemas import SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL
+from .ltm_tool import LtmMemoryTool
+from .schemas import SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL, SEARCH_LTM_TOOL
 from .session_recorder import SessionRecorder
 from . import memory_promote
 
@@ -113,14 +114,18 @@ class AgentRuntime:
         self.memory = memory
         self.doc_search = doc_search if doc_search is not None else DocSearchTool()
         self.graph_search = graph_search if graph_search is not None else GraphSearchTool()
+        self.ltm_search = LtmMemoryTool(memory)
         # 이번 대화를 STM으로 남기는 기록기. None이면 기록하지 않는다(테스트/평가용).
         self.recorder = recorder
-        # 도구는 검색 계층 둘뿐이다. 메모리(STM/MTM)는 도구가 아니라 매 턴 반드시
-        # 경유하는 전처리 파이프라인이라 여기 없다 — _prefetch_memory()가 담당한다.
-        self.tools = [SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL]
+        # 도구는 셋. 작업 메모리(STM/MTM)는 도구가 아니라 매 턴 반드시 경유하는
+        # 전처리 파이프라인이라 여기 없다 — _prefetch_memory()가 담당한다. LTM은
+        # 이미 검증된 안정 지식이라 STM/MTM과 달리 매 턴 볼 필요가 없어서 도구로
+        # 뺐다 — search_ltm_memory가 담당한다.
+        self.tools = [SEARCH_DOCUMENTS_TOOL, SEARCH_GRAPH_TOOL, SEARCH_LTM_TOOL]
         self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "search_documents": self.doc_search.run,
             "search_graph": self.graph_search.run,
+            "search_ltm_memory": self.ltm_search.run,
         }
         self._embed_fn: Callable[[Any], Any] | None = None
         self._embed_tried = False
@@ -156,26 +161,71 @@ class AgentRuntime:
         질문에서 맥락이 빠진 채 답이 나갔다. 그래서 판단을 없애고 항상 넣는다.
 
         tier는 항상 all이다 — STM/MTM 중 어디를 볼지도 모델이 정할 일이 아니다.
+        다만 "all"이 두 계층을 한 풀에 놓고 자르는 게 아니라 계층마다 따로
+        config.memory_tier_budget개씩 뽑아 합치는 것이므로(fact_memory.search 참고),
+        갓 승격된 MTM 사실이 STM 물량에 밀려 안 보이는 일이 없다.
+
+        LTM은 여기 없다 — search_ltm_memory 도구로 뺐다(__init__ 참고).
         """
-        return self.memory.search(user_query, tier="all", top_k=self.config.default_top_k)
+        return self.memory.search(user_query, tier="all",
+                                   tier_budget=self.config.memory_tier_budget)
 
     @staticmethod
     def _render_memory(facts: list) -> str:
         if not facts:
             return "[작업 메모리 STM/MTM] 이번 질문과 관련된 기억이 없습니다."
         lines = ["[작업 메모리 STM/MTM — 자동 조회, 도구 호출 아님]",
-                 "아래는 이전 대화에서 뽑아 둔 사실 문장이다. 원문 대화가 아니다."]
+                 "아래는 이전 대화에서 뽑아 둔 사실 문장이다. 원문 대화가 아니다.",
+                 "검증까지 끝난 확정 지식(LTM)이 더 필요하면 search_ltm_memory를 써라."]
         for f in facts:
             score = (f.meta or {}).get("score", "")
             lines.append(f"- ({f.tier.upper()}, {f.date}, sim={score}) {f.text}")
         return "\n".join(lines)
+
+    def _recent_turns_messages(self) -> list[dict[str, Any]]:
+        """이번 세션에서 실제로 오간 원문 대화를 최근 것부터 최대
+        config.recent_turns_char_budget자까지 실제 user/assistant 메시지로
+        되돌려준다. Letta의 recall 큐(FIFO)와 같은 역할 — STM/MTM 사실 문장으로
+        요약되지 않은 원문 맥락(말투, 직전 전개)을 이걸로 메운다.
+
+        recorder.turns는 SessionRecorder가 이번 프로세스 안에서 오간 턴을
+        (hhmm, role, text)로 계속 쌓아둔 것이다. 이번 턴(user_query)은 아직
+        여기 없다 — record_to_stm()이 답변까지 나온 뒤에 붙이기 때문에, run()
+        시작 시점에는 항상 "이전" 턴들만 들어있다.
+
+        recorder가 없으면(테스트/평가용 등) 빈 리스트를 준다 — 원문 맥락 없이도
+        동작은 되어야 한다.
+        """
+        if self.recorder is None or not self.recorder.turns:
+            return []
+        budget = self.config.recent_turns_char_budget
+        picked: list[dict[str, Any]] = []
+        total = 0
+        for _hhmm, role, text in reversed(self.recorder.turns):
+            total += len(text)
+            if total > budget and picked:
+                break
+            picked.append({"role": role, "content": text})
+        picked.reverse()
+        return picked
 
     def run(
         self,
         user_query: str,
         event_callback: Callable[[str, dict[str, Any]], None] | None = None,
         log_dir: Path | None = None,
+        defer_post: bool = False,
     ) -> dict[str, Any]:
+        """defer_post=True면 답변이 나온 뒤에 하는 STM 기록·승격 확인을 바로 하지
+        않고 result["finish"]에 콜백으로 담아 돌려준다. 답변 자체는 LLM 추론
+        루프만 끝나면 나오는데, STM 기록(FactExtractor가 LLM을 한 번 더 부름)과
+        승격 확인(_check_promotion, 리랭커 첫 호출 시 모델 로드)이 뒤에 동기로
+        붙어 있어서 CLI에서는 티가 안 나지만, HTTP 응답을 그 시점까지 붙들면
+        답변이 이미 준비됐는데도 사용자가 계속 기다리게 된다. 웹 서버 쪽에서
+        답변을 먼저 돌려주고 result["finish"]()를 백그라운드 스레드로 나중에
+        불러 마무리하도록 이 옵션을 둔다. CLI(__main__.py)는 기존처럼
+        defer_post 없이 불러 동작이 그대로다.
+        """
         trace = AgentTrace()
         turn_logger = TurnLogger(log_dir) if log_dir else None
         seen_tier_queries: set[tuple[str, str, str]] = set()
@@ -199,11 +249,18 @@ class AgentRuntime:
             })
         self._emit(event_callback, turn_logger, "memory_prefetch", trace.memory_prefetch)
 
+        recent_turns = self._recent_turns_messages()
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": self._render_memory(facts)},
-            {"role": "user", "content": user_query},
         ]
+        if recent_turns:
+            messages.append({
+                "role": "user",
+                "content": "[최근 원문 대화 — 오래된 쪽부터, 문자 수 상한을 넘기면 앞부분이 잘림]",
+            })
+            messages.extend(recent_turns)
+        messages.append({"role": "user", "content": user_query})
         for _ in range(self.config.max_tool_calls + 1):
             trace.llm_calls += 1
             message_roles = [message.get("role", "") for message in messages]
@@ -261,9 +318,15 @@ class AgentRuntime:
                     "trace": self._trace_dict(trace),
                     "messages": messages + [assistant_message],
                 }
-                self._record_to_stm(user_query, content, result)
-                self._check_promotion(trace, result)
-                self._write_turn_log(turn_logger, user_query, result)
+                def finish() -> None:
+                    self._record_to_stm(user_query, content, result)
+                    self._check_promotion(trace, result)
+                    self._write_turn_log(turn_logger, user_query, result)
+
+                if defer_post:
+                    result["finish"] = finish
+                else:
+                    finish()
                 return result
 
             messages.append(_for_replay(assistant_message))

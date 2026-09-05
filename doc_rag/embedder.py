@@ -30,7 +30,12 @@ class EmbeddingCache:
         cache_dir = CACHE_DIR / "embeddings"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path: Path = cache_dir / f"{_slug(model_id)}.sqlite3"
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: embedding_factory가 이 임베더 인스턴스를 전역
+        # 캐시로 공유한다(FactMemory/DocRetriever/GraphRetriever/AgentRuntime이
+        # 전부 같은 인스턴스를 씀). 웹 서버(chat_server)처럼 요청마다 스레드가
+        # 바뀌는 곳에서는 만들어진 스레드가 아닌 다른 스레드에서도 이 커넥션이
+        # 쓰인다. 동시 접근 직렬화는 호출부(chat_server의 _lock)가 책임진다.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS embeddings (hash TEXT PRIMARY KEY, dim INTEGER, vec BLOB)"
         )

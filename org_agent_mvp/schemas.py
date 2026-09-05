@@ -66,6 +66,45 @@ RETRIEVE_MEMORY_TOOL: dict[str, Any] = {
 }
 
 
+SEARCH_LTM_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_ltm_memory",
+        "description": (
+            "Search chat-derived long-term memory — facts that started as chat "
+            "(unlike search_documents, which is the original document corpus) but "
+            "passed verification (traceable source + truthful + useful) and were "
+            "promoted out of STM/MTM into a stable, confirmed tier. "
+            "Use this when the working-memory block (STM/MTM, given automatically "
+            "every turn) doesn't have the answer but the question is still about "
+            "something that was likely settled and repeatedly referenced in past "
+            "conversations — not about the official document corpus itself."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language search query, preferably Korean.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "Number of facts to return (default 5).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this LTM lookup is needed.",
+                },
+            },
+            "required": ["query", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 SEARCH_DOCUMENTS_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {

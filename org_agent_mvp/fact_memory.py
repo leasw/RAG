@@ -6,6 +6,10 @@ mem0가 사실 단위로 저장하고, Hermes가 "지속 가치 있는 사실"�
 
     STM  최근 STM_WINDOW_DAYS일 안에 발생한 대화에서 뽑은 사실 문장.
     MTM  STM 중 조회수 조건을 넘겨 승격된 것. 텍스트는 그대로고 계층 표시만 바뀐다.
+    LTM  MTM 중 memory_promote.promote_to_ltm()의 4개 기준(출처·진실성·공유적합성·
+         유용성)을 전부 통과한 것. doc_rag 문서 코퍼스와는 별개다 — 저 문서 코퍼스는
+         "원래 문서였던 것"이고, 이 tier="ltm"은 "채팅에서 시작해 검증을 거쳐 영구
+         지식으로 승격된 것"이다. 둘 다 개념상 장기기억이지만 원천이 다르다.
 
 **최신성은 STM에 들어올 자격이다.** 창을 벗어난 사실은 나중에 밀려나는 것이 아니라
 애초에 저장되지 않는다. STM이 "지금 굴러가는 맥락"이라면 오래된 사실은 그 정의에
@@ -47,7 +51,7 @@ import numpy as np
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS facts (
     id          TEXT PRIMARY KEY,
-    tier        TEXT NOT NULL,          -- stm | mtm
+    tier        TEXT NOT NULL,          -- stm | mtm | ltm
     text        TEXT NOT NULL,
     source_type TEXT,                   -- ai_chat | team_chat
     source_id   TEXT,                   -- 세션/방 id
@@ -98,7 +102,14 @@ class FactMemory:
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.db_path = root / "facts.sqlite3"
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: 이 커넥션을 만든 스레드가 아닌 다른 스레드에서도
+        # 쓸 수 있게 한다. 기본값(True)이면 웹 서버가 "답변 먼저 응답, 뒷정리는
+        # 백그라운드 스레드"로 나뉠 때 "SQLite objects created in a thread can only
+        # be used in that same thread"로 죽는다. 동시 접근은 여기서 막지 않으므로
+        # 호출부(chat_server 등)가 락으로 직렬화해야 한다 — sqlite3 자체가 스레드
+        # 안전하지 않은 게 아니라, 파이썬 sqlite3 모듈이 기본으로 더 보수적으로
+        # 막아둔 것뿐이라 직렬화만 지키면 안전하다.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
         self.conn.commit()
@@ -289,16 +300,44 @@ class FactMemory:
     # ------------------------------------------------------------ 읽기
 
     def search(self, query: str, tier: str = "all", top_k: int = 5,
-               source_id: str | None = None) -> list[Fact]:
-        """임베딩 코사인 검색. tier='all'이면 STM+MTM을 함께 본다.
+               source_id: str | None = None,
+               tier_budget: dict[str, int] | None = None) -> list[Fact]:
+        """임베딩 코사인 검색.
+
+        tier가 구체적 계층("stm"/"mtm"/"ltm")이면 그 계층 안에서만 top_k개를 뽑는다.
+
+        tier="all"이면 **계층마다 따로** 검색해서 합친다. 전체를 한 풀에 놓고 코사인
+        top_k로 자르면 안 된다 — STM은 수천 건, MTM/LTM은 수십 건 수준이라(실측:
+        STM 2886 / MTM 6 / LTM 58) 계층을 안 나누고 자르면 top_k가 사실상 항상
+        STM으로만 채워지고, 조회수를 쌓아 힘들게 승격시킨 MTM·LTM 사실이 관련성이
+        더 높아도 STM 물량에 밀려 안 뽑힌다.
+
+        tier_budget으로 계층별 개수를 정한다(기본은 계층마다 top_k개씩). 계층마다
+        그 개수만큼 따로 뽑아 그대로 합친다 — 계층 간에 서로 경쟁시켜 깎아내지
+        않는다. 관련도가 낮아도 각 계층에서 최소 tier_budget[tier]개는 후보로
+        들어온다는 뜻이다. 프롬프트에 실리는 총량은 그만큼 늘지만(기본 5+5+5=15),
+        "이 질문에 LTM 확정 사실이 있는데도 안 보인다" 같은 누락을 막는 게 우선이다.
+        """
+        if tier != "all":
+            return self._search_tier(query, tier, top_k, source_id)
+
+        budget = tier_budget or {t: top_k for t in ("stm", "mtm", "ltm")}
+        pooled: list[Fact] = []
+        for t, k in budget.items():
+            if k <= 0:
+                continue
+            pooled.extend(self._search_tier(query, t, k, source_id))
+        return pooled
+
+    def _search_tier(self, query: str, tier: str, top_k: int,
+                      source_id: str | None = None) -> list[Fact]:
+        """구체적 계층 하나 안에서 코사인 top_k. search()의 tier='all' 분기가
+        계층마다 이걸 따로 부른다.
 
         중복을 접지 않는다. 같은 문장이 여러 건 있으면 그대로 여러 건 나온다.
         """
-        sql = "SELECT * FROM facts WHERE vec IS NOT NULL"
-        params: list[Any] = []
-        if tier != "all":
-            sql += " AND tier = ?"
-            params.append(tier)
+        sql = "SELECT * FROM facts WHERE vec IS NOT NULL AND tier = ?"
+        params: list[Any] = [tier]
         if source_id:
             sql += " AND source_id = ?"
             params.append(source_id)
