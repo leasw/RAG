@@ -1,120 +1,106 @@
-# Org AI Agent MVP
+# doc_rag — 한국어 조직 문서 벡터 RAG
 
-조직 내 회의 기록, 최근 문서, 공식 기준 문서를 근거로 답변하는 작은 에이전트 MVP입니다. Hermes Agent의 ReAct loop와 tool result 재주입 구조를 참고해, `retrieve_memory` 도구와 STM / MTM / LTM 메모리 계층을 실험합니다.
+hwp/pdf/docx/pptx/xlsx가 섞인 실제 조직 문서 코퍼스를 대상으로 한 검색 파이프라인입니다.
+형식마다 다른 파서(Docling / pyhwp / xlrd)로 텍스트를 뽑고, 구조(heading·표) 경계를
+따라 청킹한 뒤 dense+sparse 하이브리드 검색으로 답합니다.
 
-## Core Flow
+## 파이프라인
 
-```text
-User question
--> LLM-first ReAct loop
--> retrieve_memory tool call
--> STM / MTM / LTM memory search
--> evidence cards
--> LLM re-check
--> final answer with sources
+```
+문서 파일
+  ├─ pdf/docx/pptx/xlsx ─ Docling DocumentConverter (+ OCR 폴백, EasyOCR)
+  ├─ hwp ──────────────── pyhwp(hwp5html) → XHTML → lxml 순회 → Markdown
+  │                        (Docling이 못 읽는 형식이라 표를 직접 복원한다)
+  └─ xls(구형 BIFF) ────── xlrd
+                 │
+                 ▼
+     Docling HybridChunker (형식별 max_tokens/overlap, heading 경계 우선)
+                 │
+                 ▼
+     SQLite(chunks.sqlite3) + embeddings.npy
+                 │
+질의 ─┬─ Dense: 로컬 임베더 (config/doc_rag.yaml에서 교체 가능) 코사인 top-k
+      └─ Sparse: BM25+ top-k
+                 │
+            RRF 결합
+                 │
+      Cross-encoder 리랭커로 재정렬 → 최종 top-k
 ```
 
-현재 구현은 **prefetch RAG 없이** LLM이 먼저 판단하고 필요한 경우 메모리 도구를 호출하는 구조입니다. 검색은 벡터 DB가 아니라 seed 파일을 대상으로 한 keyword 기반 top-k 검색입니다.
+## 설치
 
-## Quick Start
-
-API 키 없이 구조만 확인하려면 mock 모드로 실행합니다.
-
-```powershell
-python -m org_agent_mvp --mock --verbose --trace --question "오늘 회의 결정이 공식 계획서와 충돌해?"
+```bash
+pip install -r requirements-doc_rag.txt
 ```
 
-OpenRouter를 사용하려면 `.env.example`을 복사해 `.env`를 만들고 `OPENROUTER_API_KEY`를 입력합니다.
+`docling`/`pyhwp`/`easyocr`는 무거운 선택 의존성입니다 — hwp 인제스천이나 스캔본 OCR이
+필요 없다면 설치를 건너뛰어도 검색(`doc_rag.query`)은 이미 빌드된 인덱스로 바로 동작합니다.
 
-```powershell
-copy .env.example .env
-notepad .env
-python -m org_agent_mvp --verbose --trace --question "아까 회의에서 다음 일정 뭐였지?"
+**설치 순서 주의**: `easyocr`이 torch를 CPU 버전으로 덮어쓰는 경우가 있습니다.
+GPU를 쓸 계획이면 torch(CUDA 빌드)를 먼저 설치한 뒤 나머지를 설치하세요.
+
+## 사용
+
+```bash
+# 인덱스 빌드 (원본 문서 → 청킹 → 임베딩)
+python -m doc_rag.build_index
+
+# 원본 문서 없이 임베딩만 다시 (chunks.sqlite3에 텍스트가 이미 있을 때)
+python -m doc_rag.build_index --skip-ingest
+
+# 검색
+python -m doc_rag.query "질문"
+
+# 현재 인덱스 통계
+python -m doc_rag.build_index --stats
 ```
 
-기본 모델:
+## 설정
 
-```env
-OPENROUTER_MODEL=google/gemini-3.7-flash
+`config/doc_rag.yaml`에서 다음을 조정합니다.
+
+- `corpus.roots` — 인제스천 대상 문서 폴더
+- `chunking.by_format` — 형식별 `max_tokens`/`overlap`
+- `embedding` — 임베딩 모델(로컬/OpenRouter), `batch_size`, `max_seq_length`
+- `reranker` — 리랭커 모델, `batch_size`
+- `ocr` — 스캔본 PDF 폴백 옵션
+
+GPU 메모리가 작으면(`embedding.batch_size`, `reranker.batch_size` 축소) +
+`embedding.max_seq_length`를 실제 청크 최대 토큰 수에 맞춰 낮추는 것이 속도에
+가장 크게 영향을 줍니다 — 임베딩 모델 기본값(수천 토큰)을 그대로 두면 청크
+실제 길이(수백 토큰) 대비 어텐션 메모리를 제곱으로 낭비합니다.
+
+## 알려진 이슈 / 주의사항
+
+- **HWP 표 파싱**: `pyhwp` → Docling으로 재파싱하는 경로에서, 인접한 표 행 사이
+  줄바꿈이 사라지는 경우가 있었습니다(`doc_rag/chunking.py`의
+  `_repair_glued_table_rows`로 수정·완료). 표가 포함된 문서를 재파싱할 계획이면
+  이 경로가 최신 상태인지 확인하세요.
+- **병합 셀**: Docling 기본 표 직렬화기는 병합된 셀 값을 반복해서 채워 넣어
+  임베딩 텍스트가 중복으로 오염됩니다. `doc_rag/table_serializer.py`의
+  `CompactSerializerProvider`가 이를 막습니다 — 값은 병합 시작 위치에만 씁니다.
+- **스캔본 PDF**: 일부 한글 PDF는 Docling 기본 백엔드가 파싱에 실패합니다.
+  `pypdfium` 백엔드로 재시도하고, 그래도 실패하면(스캔 이미지) EasyOCR로 폴백합니다.
+- **구형 xls(BIFF)**: Docling(openpyxl 기반)이 못 읽어 `xlrd`로 별도 처리합니다.
+
+## 디렉터리
+
 ```
-
-## Useful Options
-
-| Option | Description |
-|---|---|
-| `--mock` | OpenRouter 호출 없이 deterministic mock LLM 사용 |
-| `--verbose` | LLM 판단과 tool 실행 과정을 터미널에 출력 |
-| `--trace` | 실행 후 요약 trace JSON 출력 |
-| `--save-log` | 한 턴의 실행 로그를 `logs/turns/*.json`에 저장 |
-| `--question`, `-q` | 단일 질문 실행 |
-
-로그를 남기는 예시:
-
-```powershell
-python -m org_agent_mvp --mock --verbose --trace --save-log --question "A 과제 예산 검토에서 보완해야 할 점이 뭐야?"
+doc_rag/
+  ingest.py              문서 → chunks.sqlite3 (형식별 컨버터 라우팅)
+  extractors.py           hwp/xls 전용 추출기
+  chunking.py             HybridChunker 래퍼 + 표 행 복구
+  table_serializer.py     병합 셀 중복 방지 표 직렬화기
+  embedding_factory.py    임베더 인스턴스 캐시(로컬/OpenRouter)
+  local_embedder.py       로컬 sentence-transformers 임베더
+  reranker.py             cross-encoder 리랭커
+  sparse.py               BM25+
+  fusion.py               RRF 결합
+  store.py                chunks.sqlite3 + embeddings.npy 저장소
+  retriever.py            dense+sparse+rerank 검색 파이프라인
+  query.py                CLI 진입점
+  build_index.py          인제스천+임베딩 CLI
+config/doc_rag.yaml        설정
+index/doc_rag/             빌드된 인덱스 (chunks.sqlite3는 추적, embeddings.npy는 재생성 가능해 제외)
+requirements-doc_rag.txt
 ```
-
-로그의 핵심 필드:
-
-```text
-summary
-reasoning_steps
-tool_executions
-trace
-answer
-transcript
-debug_events
-```
-
-`reasoning_steps`는 모델의 내부 chain-of-thought가 아니라, 실제 assistant 응답과 tool call 결과를 바탕으로 만든 관찰 가능한 판단 요약입니다.
-
-## Memory Tiers
-
-| Tier | Purpose | Examples |
-|---|---|---|
-| STM | 오늘/최근 대화, 회의, action item | "아까 회의에서 다음 일정 뭐였지?" |
-| MTM | 최근 한 달 문서, 회의록, 제안서 초안 | "최근 제안서 초안 일정이 뭐야?" |
-| LTM | 공식 계획서, 조직 기준, 장기 지식 | "공식 계획서 기준 마일스톤 알려줘" |
-
-## Project Structure
-
-```text
-org_agent_mvp/
-  org_agent_mvp/
-    __main__.py
-    agent_runtime.py
-    config.py
-    memory_store.py
-    mock_llm.py
-    openrouter_client.py
-    prompts.py
-    schemas.py
-  memory_seed/
-    stm/
-    mtm/
-    ltm/
-  .env.example
-  .gitignore
-  README.md
-```
-
-`docs/`, `logs/`, `.env`는 로컬 작업용으로 Git 추적에서 제외합니다.
-
-## Example Questions
-
-```text
-아까 회의에서 다음 일정 뭐였지?
-오늘 회의 결정이 공식 계획서와 충돌해?
-A 과제 예산 검토에서 보완해야 할 점이 뭐야?
-B 과제 시범 분석 결과는 언제 공유하기로 했어?
-MTM 문서를 LTM으로 승격하는 기준이 뭐야?
-A 과제 수정 일정표에서 공식 마일스톤과 내부 목표일이 어떻게 달라?
-```
-
-## Next Steps
-
-- Query Analyzer 추가
-- Prefetch RAG 추가
-- keyword search를 BM25 / vector / hybrid retrieval로 확장
-- MTM -> LTM 승격 후보 추천 workflow 구현
-- test question set과 turn log 기반 평가 체계 구축

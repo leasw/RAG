@@ -15,3 +15,15 @@ index/doc_rag/embeddings.npy
 .scratch/parsed_chunks.json
 .scratch/parsed_chunks.jsonl
 .scratch/parsed_chunks_shards/
+
+# 이 저장소는 벡터RAG(doc_rag)만 공유한다 — 나머지 모듈은 로컬 작업용으로만 남기고 추적하지 않는다
+graph_rag/
+org_agent_mvp/
+chat_server/
+memory_seed/
+viewer/
+data/
+index/graph_rag/
+logs/
+.claude/
+.scratch/
